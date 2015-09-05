@@ -1,0 +1,162 @@
+/*
+ * BddReasoner - A BDD-based automated reasoner for propositional modal logic
+ * by Kerry Olesen
+ * 2013
+ *
+ * This module extends the BddReasoner approach to ALCI.
+ */
+#ifndef _ALCI_H_
+#define _ALCI_H_
+
+#include "bddReasoner.h"
+#include <bdd.h>
+#include <vector>
+#include <stack>
+#include <unordered_set>
+#include <unordered_map>
+
+
+struct Edge;
+struct World;
+struct SearchNode;
+struct BoxNode;
+struct DiaNode;
+
+struct Edge {
+	int role;
+	World* otherWorld;
+	Edge(int r, World* ow): role(r), otherWorld(ow) {}
+};
+
+
+
+struct SearchNode {
+	
+	virtual bool apply() = 0;
+	
+	bool makeNewChoice();
+	
+	void refine();
+	
+	virtual void revert() = 0;
+	
+	void retryDiamonds();
+	
+	void chillOutChildChoices(World* fromWorld, World* toWorld);
+	void whipChildrenBackToWork(World* fromWorld, World* toWorld);
+	
+	virtual int getDepthForOrder() = 0;
+	
+	void destroyChildren();
+	
+	virtual ~SearchNode() {};
+	
+protected:
+	SearchNode(SearchNode* p, int md, World* w, std::vector<int> bv) :
+			origin(false), unapplied(true), world(w), maxDepth(md), parent(p), boxVars(bv),
+			chilled(false) {}
+	SearchNode(SearchNode* p, int md) :
+			origin(false), unapplied(true), world(NULL), maxDepth(md), parent(p),
+			chilled(false) {}
+			
+	// Constructor for origin node for starting the procedure.
+	SearchNode(World* o) :
+			origin(true), unapplied(false), world(o), maxDepth(0), parent(NULL), chilled(false) {}
+
+public:
+	bool origin;
+	bool unapplied;
+	World* world;
+	int maxDepth;// Depth of the longest path from the root choice to this choice.
+	SearchNode* parent;
+	std::vector<BoxNode*> boxChildren;
+	std::vector<DiaNode*> diaChildren;
+	std::vector<int> boxVars;
+	// Map restricting nodes to their responsible variables.
+	std::unordered_set<SearchNode*> restrictedBy;
+	std::unordered_set<SearchNode*> restricts;
+	
+	bdd choice;// TODO not explicitly instantiated, may be bogus.
+	bdd possibilities;
+	
+	std::unordered_set<int> refinedVars;
+	
+	bool chilled;
+	
+};
+
+struct DiaNode : public SearchNode {
+	
+	bool apply();
+	void revert();
+	
+	// Constructor for origin node for starting the procedure.
+	DiaNode (World* o) : SearchNode(o) {}
+	
+	DiaNode (SearchNode* p, int md, int dv) :
+			SearchNode(p, md), diaVar(dv), stolen(false) {}
+	
+	int getDepthForOrder() {return 2 * maxDepth;}
+	
+	~DiaNode();
+			
+	int diaVar;
+	
+	bool stolen;
+};
+
+struct BoxNode : SearchNode {
+
+	bool apply();
+	void revert();
+	
+	BoxNode (SearchNode* p, int md, World* w, std::vector<int> bv) :
+			SearchNode(p, md, w, bv), vacuous(false);  {}
+	
+	int getDepthForOrder() {return 2 * maxDepth + 1;}
+	
+	~BoxNode();
+	
+	bool vacuous;
+			
+};
+
+
+struct World {
+	bool origin;
+	std::vector<Edge> edges;// First edge is the world that had the diamond that created this world.
+	// Box variables that have been reserved for processing.
+	std::unordered_set<int> reservedBoxVars;
+	// Dia variables that have been processed.
+	std::unordered_set<int> appliedDiaVars;
+	std::vector<SearchNode*> searchNodes;// Push and pop back
+	
+	World* imitating;
+	std::unordered_set<World*> imitators;
+	
+	
+	bdd choice() {
+		return searchNodes.back()->choice;
+	}
+	
+	bdd prevChoice() {
+		return searchNodes.at(searchNodes.size() - 2)->choice;
+	}
+	
+	bdd possibilities() {
+		return searchNodes.back()->possibilities;
+	}
+	
+	// Box vars in the current choice.
+	std::vector<int> curBoxVars();
+	
+	World() : origin(false), imitating(NULL) {}
+};
+
+bool isSatisfiableALCI(bdd formulaBDD);
+void doUnsatStuff(SearchNode* node);
+void shakeImitators(World* node);
+void stopImitating(World* node);
+
+
+#endif

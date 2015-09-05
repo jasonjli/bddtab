@@ -1,0 +1,977 @@
+#include "KFormula.h"
+#include <bdd.h>
+#include <iostream>
+#include <assert.h>
+#include <map>
+#include <unordered_map>
+#include <unordered_set>
+#include <algorithm>
+#include <unistd.h>
+#include <deque>
+#include <list>
+
+
+// Hasher class for unordered_maps/_sets of bdds:
+class BddHasher {
+	public:
+		size_t operator()(const bdd& b) const {
+			return b.getRoot();
+		}
+};
+
+bool kformulaComp(const KFormula* f1, const KFormula* f2);
+const KFormula* toBoxNNF(const KFormula* f);
+void relateAtomsAndBDDVars(std::vector<const KFormula*>& atoms, std::deque<const KFormula*>& formulae);
+std::unordered_set<int>& getChildren(int var);
+void computeChildren(const KFormula* formula, std::unordered_set<int>& children);
+bdd toBDD(const KFormula* formula);
+bool isSatisfiable(bdd formulaBDD, std::unordered_set<int>& responsibleVars,
+		std::unordered_set<bdd, BddHasher>& assumedSatBDDs);
+void extractSatisfyingModalVars (bdd satValuation,
+		std::vector<int>& extBoxVars,
+		std::vector<int>& extDiaVars);
+bool refineAndRecurse(bdd& unsatBDD, bdd& formulaBDD, std::unordered_set<int>& responsibleVars,
+		std::unordered_set<bdd, BddHasher>& assumedSatBDDs);
+void cacheSat(bdd& b, std::unordered_set<bdd, BddHasher>& assumedSatBDDs);
+void cacheUnsat(std::unordered_set<int>& vars, bdd& b);
+bool shareAnElement(const std::unordered_set<int>& firstSet,
+					const std::unordered_set<int>& secondSet);
+std::unordered_set<int> getModalVars(bdd& b);
+void extractModalVars(bdd support, std::unordered_set<int>& modalVars);
+bool isSubset(std::vector<int> vector, std::unordered_set<int> set);
+void confirmSatAssumption(bdd& b);
+void rejectSatAssumption(bdd& b);
+
+// Correspondence between KFormulae and BDD variables:
+bool(*compareptr)(const KFormula*, const KFormula*) = kformulaComp;
+std::map<const KFormula*, int, bool(*)(const KFormula*,const KFormula*)> atomsToVars (compareptr);
+std::unordered_map<int, const KFormula*> varsToAtoms;
+
+// Correspondence between modal BDD variables (/formulae) and their 'children' variables (/formulae).
+// TODO vector or set? or unordered_set?
+std::map<int, std::unordered_set<int>> varsToChildren;
+
+// Variable to indicate whether any <>'s are present.
+const int existsDia = 0;
+int numVars = 1;
+
+// Repeated node checking. Results caching:
+std::unordered_set<bdd, BddHasher> satCache;
+std::map<std::vector<int>, bdd> unsatCache;
+size_t maxCacheSize = 500;
+int satCacheSize = 0;
+int unsatCacheSize = 0;
+int satCacheHits = 0;
+int unsatCacheHits = 0;
+
+// Loop checking / cyclic dependencies:
+// ie all the bdd's whose result depends on the current bdd.
+std::unordered_set<bdd, BddHasher> dependentBDDs;
+// All bdds that are currently undecided, but have been assumed true at some point.
+std::unordered_set<bdd, BddHasher> everAssumedSatBDDs;
+// List of Assumed Sat BDDs and the sat bdds under those assumptions.
+std::list<std::pair<std::unordered_set<bdd, BddHasher>, bdd>> tempSatCaches;
+
+// Global assumptions:
+bdd gammaBDD;
+
+
+// Algorithm stats:
+size_t depth = 0;
+size_t maxDepth = 0;
+int totalModalJumpsExplored = 0;
+int totalBDDRefinements = 0;
+int totalSatisfiableSatVals = 0;
+
+// TODO remove
+int numFalseFromBox = 0;//InstaFalse Modal Box
+int numFalseFromDia = 0;//InstaFalse Modal Dia
+int numFalseFromRef = 0;//InstaFalse Refinement
+
+int numResVarsIgnoredFromBox = 0;//Ignored on modal insta false over []s
+int numResVarsIgnoredFromDia = 0;//Ignored on modal insta false over <>
+int numResVarsIgnoredFromGeneral = 0;//Ignored on non-InstaFalse modals.
+
+/*
+ * BddReasoner will read in a formula psi from standard in,
+ * and will output whether psi is provable or not.
+ * It will decide this by applying the tableau method,
+ * with Binary Decision Diagrams (BDDs) as the base data structure.
+ */
+int main() {
+	// Read in the formula from standard in.
+	std::string s;
+	std::getline(std::cin, s);
+	
+	// Parse the formula psi, negate it, and translate to BoxNNF.
+	// (NNF except <>'s are turned into ~[]~'s, ~[]'s left as ~[]'s)
+	const KFormula* notpsiNNF = toBoxNNF(new KFormula(KFormula::NOT, KFormula::parseKFormula(s.c_str()), NULL));
+	
+	// TODO: Parse global assumptions from input.
+	const KFormula* gammaNNF = toBoxNNF(new KFormula(true));
+	
+	// Initialise the bdd framework.
+	bdd_init(10000, 1000);// TODO: pick reasonable numbers here.
+							// Smaller is better, garbage collection is your friend.
+		
+	// Extract the set of 'atomic' formulae, and relate each atom to a BDD variable. Maintain this correspondence.
+	// In this case box formulae are atomic, as the BDD won't be able to do anything with them.
+	std::vector<const KFormula*> atoms;
+	std::deque<const KFormula*> formulae;
+	formulae.push_back(gammaNNF);
+	formulae.push_back(notpsiNNF);
+	relateAtomsAndBDDVars(atoms, formulae);
+	// Also relate [] vars and their immediate component vars.
+	// relateModalVarsWithChildren(); Note, changed to be computed as necessary.
+	
+	// Seed the random number generator.
+    srand(unsigned(time(NULL)));
+	
+	// Build and store the bdd of gamma
+	gammaBDD = toBDD(gammaNNF);
+	
+	// Build a BDD of notpsi and gamma
+	bdd notpsiAndGammaBDD = toBDD(notpsiNNF) & gammaBDD;
+	
+	//Reordering mojo,,,
+	/*bdd support = bdd_support(formulaBDD);
+	int* variables;
+	int numVariables;
+	bdd_scanset(support, variables, numVariables);
+	for (int i = 0; i < numVariables; i++ ) {
+		bdd_intaddvarblock(*variables, *variables, BDD_REORDER_FIXED);
+		variables++;
+	}
+	bdd_autoreorder(BDD_REORDER_WIN2ITE);
+	bdd_clrvarblocks();*/
+	
+	// Responsible vars, assumedSat, won't actually use them.
+	std::unordered_set<int> responsibleVars;
+	std::unordered_set<bdd, BddHasher> assumedSatBDDs;
+	
+	bool isSat = isSatisfiable(notpsiAndGammaBDD, responsibleVars, assumedSatBDDs);
+	if (isSat) {
+		std::cout << "Not-psi and Gamma is Satisfiable, Psi is Not provable from Gamma.";
+	} else {
+		std::cout << "Not-psi and Gamma is Unsatisfiable, Psi is Provable from Gamma.";
+	}
+	// Algorithm Stats:
+	// CacheStats:
+	std::cout << " (" << satCacheSize << ":" << satCacheHits;
+	std::cout << " / " << unsatCacheSize << ":" << unsatCacheHits << ")";
+	// Variables
+	std::cout << " [V: " << numVars << ",";
+	// Max depth of the 'tree'
+	std::cout << " D: " << maxDepth << ",";
+	std::cout << " MJ: " << totalModalJumpsExplored << ",";
+	std::cout << " SatMJ: " << totalSatisfiableSatVals << ",";
+	std::cout << " UnsatMJ: " << totalModalJumpsExplored - totalSatisfiableSatVals + 1 << ",";
+	std::cout << " Ref: " << totalBDDRefinements << ",";
+	std::cout << " FFM[]: " << numFalseFromBox << ",";
+	std::cout << " FFM<>: " << numFalseFromDia << ",";
+	std::cout << " FFRef: " << numFalseFromRef << ",";
+	std::cout << " Ig[]: " << numResVarsIgnoredFromBox << ",";
+	std::cout << " Ig<>: " << numResVarsIgnoredFromDia << ",";
+	std::cout << " IgGen: " << numResVarsIgnoredFromGeneral << "]";
+	
+	bdd_done();
+	
+	return 0;
+}
+
+/*
+ *  BoxNNF: NNF with the following exceptions:
+ *  ~[]phi's will be left alone, <>phi's will be turned into ~[]~phi's
+ */
+const KFormula* toBoxNNF(const KFormula* f) {
+	switch (f->getop()) {
+		case KFormula::AP:
+			return f;
+		case KFormula::AND:
+			return new KFormula(KFormula::AND, toBoxNNF(&(f->getleft())), toBoxNNF(&(f->getright())));
+		case KFormula::OR:
+			return new KFormula(KFormula::OR, toBoxNNF(&(f->getleft())), toBoxNNF(&(f->getright())));
+		case KFormula::BOX:
+			return new KFormula(KFormula::BOX, toBoxNNF(&(f->getleft())), NULL);
+		case KFormula::DIA:// BoxNNF, swap [DIA phi] to [~ BOX ~ phi].
+			return new KFormula(KFormula::NOT,
+								new KFormula(KFormula::BOX,
+									toBoxNNF(new KFormula(KFormula::NOT,
+										&(f->getleft()),
+										NULL)),
+									NULL),
+								NULL);
+		case KFormula::TRUE:
+			return f;
+		case KFormula::FALSE:
+			return f;
+		case KFormula::IMP:
+			return toBoxNNF(new KFormula(KFormula::OR, new KFormula(KFormula::NOT, &(f->getleft()), NULL), &(f->getright())));
+		case KFormula::NOT:
+			switch (f->getleft().getop()) {
+				case KFormula::AP:
+					return f;
+				case KFormula::AND:
+					return new KFormula(KFormula::OR,
+								toBoxNNF(new KFormula(KFormula::NOT, &(f->getleft().getleft()), NULL)),
+								toBoxNNF(new KFormula(KFormula::NOT, &(f->getleft().getright()), NULL)));
+				case KFormula::OR:
+					return new KFormula(KFormula::AND,
+								toBoxNNF(new KFormula(KFormula::NOT, &(f->getleft().getleft()), NULL)),
+								toBoxNNF(new KFormula(KFormula::NOT, &(f->getleft().getright()), NULL)));
+				case KFormula::BOX:// BoxNNF, leave [~ BOX]s as they are.
+					return new KFormula(KFormula::NOT, toBoxNNF(&(f->getleft())), NULL);
+				case KFormula::DIA:
+					return new KFormula(KFormula::BOX,
+								toBoxNNF(new KFormula(KFormula::NOT, &(f->getleft().getleft()), NULL)),
+								NULL);
+				case KFormula::TRUE:
+					return new KFormula(false);
+				case KFormula::FALSE:
+					return new KFormula(true);
+				case KFormula::IMP:
+					return toBoxNNF(new KFormula(KFormula::AND, &(f->getleft().getleft()), new KFormula(KFormula::NOT, &(f->getleft().getright()), NULL)));
+				case KFormula::NOT:
+					return toBoxNNF(&(f->getleft().getleft()));
+				case KFormula::EQU:
+					return new KFormula(KFormula::AND,
+								new KFormula(KFormula::OR,
+									toBoxNNF(new KFormula(KFormula::NOT, &(f->getleft().getleft()), NULL)),
+									toBoxNNF(new KFormula(KFormula::NOT, &(f->getleft().getright()), NULL))),
+								new KFormula(KFormula::OR,
+									toBoxNNF(&(f->getleft().getleft())),
+									toBoxNNF(&(f->getleft().getright()))));
+				default:
+					assert(false && "Defaulted out of complete switch.");
+			}
+		case KFormula::EQU:
+			return new KFormula(KFormula::OR,
+							new KFormula(KFormula::AND,
+								toBoxNNF(&(f->getleft())),
+								toBoxNNF(&(f->getright()))),
+							new KFormula(KFormula::AND,
+								toBoxNNF(new KFormula(KFormula::NOT, &(f->getleft()), NULL)),
+								toBoxNNF(new KFormula(KFormula::NOT, &(f->getright()), NULL))));
+		default:
+			assert(false && "Defaulted out of complete switch.");
+	}
+}
+
+/* TODO: write this
+ * To use c++ sets of KFormula*.
+ */
+bool kformulaComp(const KFormula* f1, const KFormula* f2) {
+	return ((*f1).compare((*f2)) < 0);
+}
+
+/* Assumes BoxNNF (no <>, => or <=>)
+	Will add the atoms of formula to atoms. TODO make atoms the second argument, makes more sense that way.
+	Will add atoms in breadth-first order, as they are found in the formula tree.
+*/
+void relateAtomsAndBDDVars(std::vector<const KFormula*>& atoms, std::deque<const KFormula*>& formulae) {
+	const KFormula* formula = formulae.front();
+	formulae.pop_front();
+	switch (formula->getop()) {
+		case KFormula::AP:
+			atoms.push_back(formula);
+			break;
+		case KFormula::BOX:
+			atoms.push_back(formula);
+			formulae.push_back(&(formula->getleft()));
+			break;
+		case KFormula::NOT:
+			// Immediately continue with the unnegated formula.
+			formulae.push_front(&(formula->getleft()));
+			break;
+		case KFormula::AND:// Fall through
+		case KFormula::OR:
+			// Breadth-first add from both sides.
+			formulae.push_back(&(formula->getleft()));
+			formulae.push_back(&(formula->getright()));
+			break;
+		case KFormula::TRUE:
+			break;
+		case KFormula::FALSE:
+			break;
+		case KFormula::DIA:
+			assert(false && "Atom adding not defined for <>.");
+		case KFormula::IMP:
+			assert(false && "Atom adding not defined for =>.");
+		case KFormula::EQU:
+			assert(false && "Atom adding not defined for <=>.");
+		default:
+			assert(false && "Defaulted out of complete switch");
+	}
+	if (!formulae.empty()) {
+		relateAtomsAndBDDVars(atoms, formulae);
+	} else {
+		// Relate all the extracted atoms with bdd variables.
+		for (std::vector<const KFormula*>::iterator it = atoms.begin(); it < atoms.end(); it++) {
+			if (atomsToVars.count(*it) == 0) {
+				atomsToVars.insert(std::pair<const KFormula*, int>(*it, numVars));
+				varsToAtoms.insert(std::pair<int, const KFormula*>(numVars, *it));
+				numVars++;
+			}
+		}
+		bdd_setvarnum(numVars);
+	}
+}
+
+/*
+	Assumes BoxNNF, var is a box formula.
+*/
+std::unordered_set<int>& getChildren(int var) {
+	if (varsToChildren.count(var) == 0) {
+		// Get all immediate children
+		std::unordered_set<int> children;
+		computeChildren(&(varsToAtoms.at(var)->getleft()), children);
+		// add them to the global relations.
+		varsToChildren.insert(std::pair<int, std::unordered_set<int>>(var, children));
+	}
+	return varsToChildren.at(var);
+}
+
+/*
+	Assumes BoxNNF
+*/
+void computeChildren(const KFormula* formula, std::unordered_set<int>& children) {
+	switch (formula->getop()) {
+		case KFormula::AP:// Fall through
+		case KFormula::BOX:
+			children.insert(atomsToVars.at(formula));
+			break;
+		case KFormula::NOT:
+			// Continue getting children from past the negation.
+			computeChildren(&(formula->getleft()), children);
+			break;
+		case KFormula::AND:// Fall through
+		case KFormula::OR:
+			// Left to right get from both sides.
+			computeChildren(&(formula->getleft()), children);
+			computeChildren(&(formula->getright()), children);
+			break;
+		case KFormula::TRUE:
+			break;
+		case KFormula::FALSE:
+			break;
+		case KFormula::DIA:
+			assert(false && "Children getting not defined for <>.");
+		case KFormula::IMP:
+			assert(false && "Children getting not defined for =>.");
+		case KFormula::EQU:
+			assert(false && "Children getting not defined for <=>.");
+		default:
+			assert(false && "Defaulted out of complete switch");
+	}
+}
+
+/*TODO
+	Assumes BoxNNF
+*/
+bdd toBDD(const KFormula* formula) {
+	switch (formula->getop()) {
+		case KFormula::AP:// Fall through
+		case KFormula::BOX:
+			// Return the bdd to the related variable.
+			return bdd_ithvar(atomsToVars.at(formula));
+		case KFormula::NOT:
+			// Due to BoxNNF, getleft() will either be a [] or prop.
+			if (formula->getleft().getop() == KFormula::BOX) {
+				// Note the presence of a <>.
+				return bdd_nithvar(atomsToVars.at(&(formula->getleft()))) & bdd_ithvar(existsDia);
+			} else {
+				return bdd_not(toBDD(&(formula->getleft())));
+			}
+		case KFormula::AND:
+			return ( toBDD(&(formula->getleft())) & toBDD(&(formula->getright())) );
+		case KFormula::OR:
+			return ( toBDD(&(formula->getleft())) | toBDD(&(formula->getright())) );
+		case KFormula::TRUE:
+			return bddtrue;
+		case KFormula::FALSE:
+			return bddfalse;
+		case KFormula::DIA:
+			assert(false && "toBDD not defined for <>.");
+		case KFormula::IMP:
+			assert(false && "toBDD not defined for =>.");
+		case KFormula::EQU:
+			assert(false && "toBDD not defined for <=>.");
+		default:
+			assert(false && "Defaulted out of complete switch");
+	}
+}
+
+/*TODO
+	Assumes BoxNNF.
+	Since <>phi's are stored as []~phi's, un<>ing them will negate phi.
+	This function is a handy way doing that.
+	Also, due to the negation, []'s and <>'s in phi will be reversed,
+	so handling of existsDia needs to be reversed.
+*/
+bdd toNotBDD(const KFormula* formula) {
+	switch (formula->getop()) {
+		case KFormula::AP:
+			// Return the bdd to the negation of the related variable.
+			return bdd_nithvar(atomsToVars.at(formula));
+		case KFormula::BOX:
+			// Return the bdd to the negation of the related variable. Note presence of a <>.
+			return bdd_nithvar(atomsToVars.at(formula)) & bdd_ithvar(existsDia);
+		case KFormula::NOT:
+			if (formula->getleft().getop() == KFormula::BOX) {
+				return bdd_ithvar(atomsToVars.at(&(formula->getleft())));
+			} else {
+				return bdd_not(toNotBDD(&(formula->getleft())));
+			}
+		case KFormula::AND:// Not 'and's become 'or's.
+			return ( toNotBDD(&(formula->getleft())) | toNotBDD(&(formula->getright())) );
+		case KFormula::OR:// Not 'or's become 'and's.
+			return ( toNotBDD(&(formula->getleft())) & toNotBDD(&(formula->getright())) );
+		case KFormula::TRUE:
+			return bddfalse;
+		case KFormula::FALSE:
+			return bddtrue;
+		case KFormula::DIA:
+			assert(false && "toNotBDD not defined for <>.");
+		case KFormula::IMP:
+			assert(false && "toNotBDD not defined for =>.");
+		case KFormula::EQU:
+			assert(false && "toNotBDD not defined for <=>.");
+		default:
+			assert(false && "Defaulted out of complete switch");
+	}
+}
+
+/*TODO: write this description.
+	If a bdd is Unsat, responsibleVars will contain all the variables that were 
+	directly involved in making it Unsat.
+	If a bdd is Sat, assumedSatBDDs will contain all bdds that were assumed true
+	to get that result. (Due to cycles)
+*/
+bool isSatisfiable(bdd formulaBDD, std::unordered_set<int>& responsibleVars,
+std::unordered_set<bdd, BddHasher>& assumedSatBDDs) {
+	
+	// Algortihmstats/
+	depth++;// TODO: change this so you don't have to remember to 'depth--' at every return.
+	if (depth > maxDepth) {
+		maxDepth = depth;
+	}
+	
+	// Loop checking / cyclic dependency checking
+	/*
+	if (dependentBDDs.count(formulaBDD) == 1) {
+		// Then we have a cyclic dependency.
+		// Presume for now that the cycle bdd is satisfiable and continue
+		// TODO: Must prevent any Sat caching that relies on this assumption, until we get back to the looped bdd.
+		// Or until the looping BDD refines and loses the loop... great... back to the looped BDD is easier, safer.
+		// TODO: Responsible Variables? All. I think.
+		depth--;
+		return true; 
+	}*/ 
+	// ------------- Going to do this elsewhere --------------------- //
+	
+	// Sat results caching.
+	if (satCache.count(formulaBDD) == 1) {
+		// Then we have already proven this is Satisfiable.
+		satCacheHits++;
+		depth--;
+		totalSatisfiableSatVals++;
+		return true;
+	}
+    
+    // If the bdd is T:
+    //	Then everything satisfies
+    if (formulaBDD == bddtrue) {
+    	depth--;
+		totalSatisfiableSatVals++;
+    	return true;
+    }
+    // TODO IMPORTANT: WANT TO CATCH ALL FALSE's BEFORE RECURSING WITH THEM.
+    // Mostly because we want to know about responsible vars.
+    //  Then this should only catch that the given formula / assumptions are incongruous.
+    // If the bdd is F:
+    //	Then nothing satisfies
+    if (formulaBDD == bddfalse) {
+    	depth--;
+    	return false;
+    }
+	
+	// Get one satisfying valuation out of the formulaBDD:
+	bdd satisfyingValuation = bdd_satone(formulaBDD);
+    
+    // Make sets of the modal formulae in the satisfying valuation.
+    // Variables const KFormula*
+    std::vector<int> boxVars;
+    std::vector<int> diaVars;
+    // Attempted: sorting diaFormulae by modal depth. (Lowest first) No better than no reordering at all.
+	//bool(*modaldepthcompareptr)(const KFormula*, const KFormula*) = kformulaModalDepthComp;
+    //std::multiset<const KFormula*, bool(*)(const KFormula*, const KFormula*)> diaFormulae (modaldepthcompareptr);
+    extractSatisfyingModalVars(satisfyingValuation, boxVars, diaVars);
+    // TODO: apparently implementation specific, may not be affected by srand.
+    // TODO: come up with a better heuristic than randomness. NOTE: Not sure good heuristic exists.
+    std::random_shuffle(diaVars.begin(), diaVars.end());
+    // TODO: interesting, does randomising the box order make any difference?
+    // Nothing hugely noticable, takes d4_n from 0.2 to 0.1, that seems to be it.
+    //std::random_shuffle(boxFormulae.begin(), boxFormulae.end());
+	
+    // If diaFormulae is empty
+    //	Then we're satisfiable.
+    // Else
+    //	Then we need to see if the conjunction of the box formulae and each dia formula is sat.
+    // If one of those returns 'unsat', then we need to know the bdd vars, so we can modify the original formula
+    // to say that they can't be like that. Then check the sat of that modified formula.
+	if (diaVars.empty()) {
+		depth--;
+		totalSatisfiableSatVals++;
+		return true;
+	} else {
+		
+		
+		// Record the current bdd for loop checking.
+		dependentBDDs.insert(formulaBDD);
+		
+		// Build unboxedBDD by unboxing the box formulae.
+		bdd unboxedBDD = gammaBDD;// Note gamma is included here.
+		for (std::vector<int>::iterator boxIt = boxVars.begin(); boxIt != boxVars.end(); ++boxIt) {
+			unboxedBDD = unboxedBDD & toBDD(&((varsToAtoms.at(*boxIt))->getleft()));
+			
+			// If at any time the unboxedBDD becomes false, we can skip straight to making a refinement.
+			if (unboxedBDD == bddfalse) {
+				totalModalJumpsExplored++;// TODO stats, to be removed.
+				// FF[] TODO remove stats when not needed.
+				numFalseFromBox++;
+				// TODO stat: Number of potential responsible variables successfully ignored.
+				numResVarsIgnoredFromBox += boxVars.size();
+				
+				
+				// Something close to minimal unsat subset.
+				// Find a minimal subset of formulae that are instafalse.
+				// Then refine over just those.
+				unboxedBDD = gammaBDD & toBDD(&((varsToAtoms.at(*boxIt))->getleft()));
+				responsibleVars.insert(*boxIt);
+				bdd unsatBDD = bdd_ithvar(*boxIt) & bdd_ithvar(existsDia);// These boxes are only unsat if there is a <> present as well.
+				std::vector<int>::iterator endIt = boxIt;
+				bdd minimalBDD = unboxedBDD;
+				while (true) {
+					unboxedBDD = minimalBDD;
+					if (unboxedBDD == bddfalse) {
+						// We're done, the last one added was sufficient to ensure false.
+						break;
+					}
+					for (boxIt = boxVars.begin(); boxIt != endIt; boxIt++) {
+						unboxedBDD = unboxedBDD & toBDD(&((varsToAtoms.at(*boxIt))->getleft()));
+						if (unboxedBDD == bddfalse) {
+							// Then this last one made it false.
+							numResVarsIgnoredFromBox--;
+							unsatBDD = unsatBDD & bdd_ithvar(*boxIt);
+							responsibleVars.insert(*boxIt);
+							endIt = boxIt;
+							minimalBDD = minimalBDD & toBDD(&((varsToAtoms.at(*boxIt))->getleft()));
+							break;
+						}
+					}
+				}
+				unsatBDD = bdd_not(unsatBDD);
+				
+				return refineAndRecurse(unsatBDD, formulaBDD, responsibleVars, assumedSatBDDs);
+			}
+		}
+		
+		// Modal jump for each dia formula.
+		for (std::vector<int>::iterator
+				diaIt = diaVars.begin(); diaIt != diaVars.end(); ++diaIt) {
+			totalModalJumpsExplored++;// TODO stats, to be removed.
+			
+			bdd modalJumpBDD = unboxedBDD & toNotBDD(&((varsToAtoms.at(*diaIt))->getleft()));// un<>ing uses toNotBDD, as they are stored as []'s.
+			
+			// If that makes it False, then we know <> introduces a contradiction, so we can skip straight to making a refinement.
+			if (modalJumpBDD == bddfalse) {
+				// FF<>
+				numFalseFromDia++;
+				
+				// Then <> and some subset of []s leads to false. (and gamma).
+				// Record responsible vars as only those in the subset.
+				modalJumpBDD = gammaBDD & toNotBDD(&((varsToAtoms.at(*diaIt))->getleft()));// un<>ing uses toNotBDD, as they are stored as []'s.
+				responsibleVars.insert(*diaIt);
+				bdd unsatBDD = bdd_nithvar(*diaIt) & bdd_ithvar(existsDia);// Note, elements in diaFormulae are stored as [] formula, thus the nith.
+				// TODO stat: Number of potential responsible variables successfully ignored.
+				numResVarsIgnoredFromDia += boxVars.size();
+				
+				// Go the whole way and determine an actually minimal unsat subset.
+				std::vector<int>::iterator endIt = boxVars.end();
+				bdd minimalBDD = modalJumpBDD;
+				while (true) {
+					modalJumpBDD = minimalBDD;
+					if (modalJumpBDD == bddfalse) {
+						// We're done, the last one added was sufficient to ensure false.
+						break;
+					} else {
+						for (std::vector<int>::iterator boxIt = boxVars.begin(); boxIt != endIt; ++boxIt) {
+							modalJumpBDD = modalJumpBDD & toBDD(&((varsToAtoms.at(*boxIt))->getleft()));// TODO Store these created bdds, so we don't have to recreate them every time, even if there is some caching going on.
+							// TODO stat: Number of potential responsible variables successfully ignored.
+							if (modalJumpBDD == bddfalse) {
+								// The last [] introduced the false. Add it to the minimal set, and start again.
+								minimalBDD = minimalBDD & toBDD(&((varsToAtoms.at(*boxIt))->getleft()));
+								unsatBDD = unsatBDD & bdd_ithvar(*boxIt);
+								numResVarsIgnoredFromDia--;
+								responsibleVars.insert(*boxIt);
+								endIt = boxIt;// No need to go beyond this one again.
+								break;
+							}
+						}
+					}
+				}
+				
+				unsatBDD = bdd_not(unsatBDD);
+				
+				return refineAndRecurse(unsatBDD, formulaBDD, responsibleVars, assumedSatBDDs);
+			}
+			
+			// Check for loops here:
+			if (dependentBDDs.count(modalJumpBDD) == 1) {
+				// Then we have a cyclic dependency.
+				// Assume that the cycle bdd is satisfiable and continue.
+				// Will then prevent any Sat caching that relies on this assumption.
+				assumedSatBDDs.insert(modalJumpBDD);
+				everAssumedSatBDDs.insert(modalJumpBDD);
+				continue;// To the next modal jump.
+			}
+			
+			// Make space for getting the responsible vars and assumedSatBDDs.
+			std::unordered_set<int> postModalJumpResVars;
+			std::unordered_set<bdd, BddHasher> postModalJumpAssumedSatBDDs;
+			
+			// Check unsat cache here, for the modalJumpBDD.
+			// (Done here, as there is no point doing it after a refinement.
+			// ie There's no point doing it on the same bdd twice.)
+			std::unordered_set<int> cacheResVars;
+			// If the unsat cache is empty, don't bother.
+			if (!unsatCache.empty()) {
+				std::unordered_set<int> modalJumpModalVars = getModalVars(modalJumpBDD);
+				for (std::map<std::vector<int>, bdd>::iterator unsatIt = unsatCache.begin();
+				unsatIt != unsatCache.end(); unsatIt++) {
+					if (isSubset(unsatIt->first, modalJumpModalVars)) {
+						unsatCacheHits++;
+						modalJumpBDD = modalJumpBDD & unsatIt->second;
+						cacheResVars.insert(unsatIt->first.begin(), unsatIt->first.end());
+						if (modalJumpBDD == bddfalse) {
+							break;// Will isSatisfiable to false, but we've already filled resVars, so it's ok.
+						}
+					}
+				}
+			}
+			
+			// Need to check for loops again after unsat cache stuff:
+			if (dependentBDDs.count(modalJumpBDD) == 1) {
+				// Then we have a cyclic dependency.
+				// Assume that the cycle bdd is satisfiable and continue.
+				// Will then prevent any Sat caching that relies on this assumption.
+				assumedSatBDDs.insert(modalJumpBDD);
+				everAssumedSatBDDs.insert(modalJumpBDD);
+				continue;// To the next modal jump.
+			}
+			
+			// And check for unsatisfiability.
+			if (!isSatisfiable(modalJumpBDD, postModalJumpResVars, postModalJumpAssumedSatBDDs)) {
+				// If Unsatisfiable:
+				// Then we want to modify the bdd, and recurse with that.
+				// But only refine over the []/<> variables that introduced at least one ResponsibleVariable 
+				// from the modal jump. But if a variable introduces one of those, we'll have
+				// to consider the other variables it introduces as potentially responsible as well.
+				
+				// Add in resVars from the unsatCache
+				postModalJumpResVars.insert(cacheResVars.begin(), cacheResVars.end());
+				
+				// TODO stats
+				numResVarsIgnoredFromGeneral += boxVars.size() + 1;
+				bdd unsatBDD = bdd_ithvar(existsDia);
+				bool newPostModalJumpResVarsAdded = true;
+				while (newPostModalJumpResVarsAdded) {
+					newPostModalJumpResVarsAdded = false;
+					for (std::vector<int>::iterator boxIt = boxVars.begin(); boxIt != boxVars.end(); ++boxIt) {
+						if (responsibleVars.count(*boxIt) != 0) {
+							// Don't bother, we've already accounted for this box var.
+						} else if (shareAnElement(postModalJumpResVars, getChildren(*boxIt))) {
+							unsatBDD = unsatBDD & bdd_ithvar(*boxIt);
+							responsibleVars.insert(*boxIt);
+							numResVarsIgnoredFromGeneral--;// TODO stats
+							// Add in other children to postModalJumpResVars
+							postModalJumpResVars.insert(getChildren(*boxIt).begin(),
+														getChildren(*boxIt).end());
+							newPostModalJumpResVarsAdded = true;
+						}
+					}
+					if (responsibleVars.count(*diaIt) != 0) {
+						// Don't bother, we've already accounted for this dia var.
+					} else if (shareAnElement(postModalJumpResVars, getChildren(*diaIt))) {
+						unsatBDD = unsatBDD & bdd_nithvar(*diaIt);// Note, stored as [] formula, thus the nith.
+						responsibleVars.insert(*diaIt);
+						numResVarsIgnoredFromGeneral--;// TODO stats
+						// Add in other children to postModalJumpResVars
+						postModalJumpResVars.insert(getChildren(*diaIt).begin(),
+													getChildren(*diaIt).end());
+						newPostModalJumpResVarsAdded = true;
+					}
+				}
+				unsatBDD = bdd_not(unsatBDD);
+				
+				return refineAndRecurse(unsatBDD, formulaBDD, responsibleVars, assumedSatBDDs);
+			}
+			
+			// Accumulate assumedSatBDDS
+			assumedSatBDDs.insert(postModalJumpAssumedSatBDDs.begin(), postModalJumpAssumedSatBDDs.end());
+			
+		}
+		// All of them were satisfiable:
+		// If currently assumed Sat, it now has a value and need not be assumed.
+		if (assumedSatBDDs.count(formulaBDD) == 1) {
+			assumedSatBDDs.erase(formulaBDD);
+		}
+		// Discharge any Sat assumptions of this bdd.
+		if (everAssumedSatBDDs.count(formulaBDD) == 1) {
+			confirmSatAssumption(formulaBDD);
+		}
+		cacheSat(formulaBDD, assumedSatBDDs);// CacheSat will handle any assumptions.
+		dependentBDDs.erase(formulaBDD);
+		depth--;
+		totalSatisfiableSatVals++;
+		return true;
+	}
+	
+}
+
+bool refineAndRecurse(bdd& unsatBDD, bdd& formulaBDD, std::unordered_set<int>& responsibleVars,
+						std::unordered_set<bdd, BddHasher>& assumedSatBDDs) {
+	// Cache unsat leaf (negation of)
+	cacheUnsat(responsibleVars, unsatBDD);
+	
+	bdd refinedBDD = formulaBDD & unsatBDD;
+	
+	// TODO: remove stats when not needed.
+	totalBDDRefinements++;
+	
+	// TODO ignore accumulated assumptions.
+	assumedSatBDDs.clear();
+
+	// Make space for getting the responsible vars.
+	std::unordered_set<int> postRefinementResVars;
+
+	bool isSat;
+	// Catch refinement instaFalse.
+	if (refinedBDD == bddfalse) {
+		numFalseFromRef++;
+		isSat = false;
+	}// Check for loops here as well:
+	else if (dependentBDDs.count(refinedBDD) == 1) {
+		// Then we have a cyclic dependency.
+		// Assume that the cycle bdd is satisfiable and continue.
+		// Will then prevent any Sat caching that relies on this assumption.
+		assumedSatBDDs.insert(refinedBDD);
+		everAssumedSatBDDs.insert(refinedBDD);
+		isSat = true;
+	} else {// Go determine the satisfiability of the refined bdd.
+		// TODO: remove algorithm stats when not needed.
+		depth--;
+		isSat = isSatisfiable(refinedBDD, postRefinementResVars, assumedSatBDDs);
+		depth++;
+	}
+	
+	// If currently assumed Sat, it now has a value and need not be assumed.
+	if (assumedSatBDDs.count(formulaBDD) == 1) {
+		assumedSatBDDs.erase(formulaBDD);
+	}
+
+	if (isSat) {
+		if (everAssumedSatBDDs.count(formulaBDD) == 1) {
+			// Discharge any Sat assumptions of this bdd.
+			confirmSatAssumption(formulaBDD);
+		}
+		cacheSat(formulaBDD, assumedSatBDDs);
+	} else {
+		// Pass back responsible variables from all refinements.
+		responsibleVars.insert(postRefinementResVars.begin(), postRefinementResVars.end());
+		if (everAssumedSatBDDs.count(formulaBDD) == 1) {
+			// Reject any Sat assumptions of this bdd.
+			rejectSatAssumption(formulaBDD);
+		}
+	}
+	depth--;
+	dependentBDDs.erase(formulaBDD);
+	return isSat;
+}
+
+/* Takes a satisfying valuation of a bdd (ie from bdd_satone),
+ * and extracts the corresponding modal variables, putting them into the given sets.
+ * (Non-modal vars are ignored.)
+ * (Assumes BoxNNF, ie all modal formula represented by []s.)
+*/
+void extractSatisfyingModalVars (bdd satValuation,
+		std::vector<int>& extBoxVars,
+		std::vector<int>& extDiaVars) {
+	if (bdd_low(satValuation) == bddfalse) {
+		// Only consider the modal ones: (and ignore the existsDia var)
+		if (bdd_var(satValuation) != existsDia
+		&& varsToAtoms.at(bdd_var(satValuation))->getop() == KFormula::BOX) {
+			// Formula is true in the valuation:
+			extBoxVars.push_back(bdd_var(satValuation));
+		}
+		if (bdd_high(satValuation) != bddtrue) {
+			// Extract formulae from the rest of the bdd.
+			extractSatisfyingModalVars(bdd_high(satValuation), extBoxVars, extDiaVars);
+		}
+	} else {//bdd_high == bddfalse, by def of satone.
+		// Only consider the modal ones:
+		if (bdd_var(satValuation) != existsDia
+		&& varsToAtoms.at(bdd_var(satValuation))->getop() == KFormula::BOX) {
+			// Formula was false in the valuation.
+			//extDiaFormulae.insert(varsToAtoms.at(bdd_var(satValuation)));
+			extDiaVars.push_back(bdd_var(satValuation));
+		}
+		if (bdd_low(satValuation) != bddtrue) {
+			// Extract formulae from the rest of the bdd.
+			extractSatisfyingModalVars(bdd_low(satValuation), extBoxVars, extDiaVars);
+		}
+	}
+}
+
+void cacheSat(bdd& b, std::unordered_set<bdd, BddHasher>& assumedSatBDDs) {
+	if (assumedSatBDDs.empty()) {
+		if (satCache.size() >= maxCacheSize) {
+			// Remove one random element
+			// TODO pick an element better than randomly. Probs not feasible.
+			size_t index = rand() % satCache.size();
+			std::unordered_set<bdd, BddHasher>::iterator it = satCache.begin();
+			for (size_t i = 0; i < index; i++) {
+				it++;
+			}
+			satCache.erase(it);
+		}
+		satCache.insert(b);
+		satCacheSize++;// TODO stats
+	} else {
+		tempSatCaches.push_back(std::pair<std::unordered_set<bdd, BddHasher>, bdd>(assumedSatBDDs, b));
+	}
+}
+
+void cacheUnsat(std::unordered_set<int>& vars, bdd& b) {
+	if (unsatCache.size() >= maxCacheSize) {
+		// Remove one random element
+		// TODO pick an element better than randomly. Probs not feasible.
+		size_t index = rand() % unsatCache.size();
+		std::map<std::vector<int>, bdd>::iterator it = unsatCache.begin();
+		for (size_t i = 0; i < index; i++) {
+			it++;
+		}
+		unsatCache.erase(it);
+	}
+	// Make the ordered vector
+	std::vector<int> orderedVars;
+	orderedVars.insert(orderedVars.begin(), vars.begin(), vars.end());
+	std::sort(orderedVars.begin(), orderedVars.end());
+	if (unsatCache.count(orderedVars) != 0) {
+		// Cache already has a bdd for these vars.
+		bdd updatedBDD = unsatCache.at(orderedVars) & b;
+		unsatCache.insert(std::pair<std::vector<int>, bdd>(orderedVars, updatedBDD));
+	} else {
+		unsatCache.insert(std::pair<std::vector<int>, bdd>(orderedVars, b));
+	}	
+	unsatCacheSize++;// TODO stats
+}
+
+
+bool shareAnElement(const std::unordered_set<int>& firstSet,
+					const std::unordered_set<int>& secondSet) {
+	if (firstSet.size() < secondSet.size()) {
+		for (std::unordered_set<int>::const_iterator it = firstSet.begin(); it != firstSet.end(); it++) {
+			if (secondSet.count(*it) != 0) {
+				return true;
+			}
+		}
+		return false;
+	} else {
+		for (std::unordered_set<int>::const_iterator it = secondSet.begin(); it != secondSet.end(); it++) {
+			if (firstSet.count(*it) != 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+}
+
+
+std::unordered_set<int> getModalVars(bdd& b) {
+	bdd support = bdd_support(b);
+	std::unordered_set<int> modalVars;
+	if (b != bddtrue && b != bddfalse) {
+		extractModalVars(support, modalVars);
+	}
+	return modalVars;
+}
+
+void extractModalVars(bdd support, std::unordered_set<int>& modalVars) {
+	if (support == bddtrue) {
+		return;
+	}
+	if (bdd_var(support) != existsDia// existsDia needs to be explicitly handled, as it isn't related to an atom.
+	&& varsToAtoms.at(bdd_var(support))->getop() == KFormula::BOX) {
+		modalVars.insert(bdd_var(support));
+	}
+	extractModalVars(bdd_high(support), modalVars);
+}
+
+/*
+	Returns whether the vector is a subset of the set.
+*/
+bool isSubset(std::vector<int> vector, std::unordered_set<int> set) {
+	if (vector.size() > set.size()) {
+		return false;
+	}
+	for (size_t i = 0; i < vector.size(); i++) {
+		if (set.count(vector.at(i)) == 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+
+void confirmSatAssumption(bdd& b) {
+	// Go through tempSatCaches
+	for (std::list<std::pair<std::unordered_set<bdd, BddHasher>, bdd>>
+			::iterator it = tempSatCaches.begin();
+			it != tempSatCaches.end(); it++) {
+		// eliminate b from any tempSatCaches that contain it.
+		if (it->first.count(b) == 1) {
+			it->first.erase(b);
+			// If they don't have any assumptions any more, transfer from temp to real cache.
+			if (it->first.empty()) {
+				// Empty assumptions for using cacheSat
+				std::unordered_set<bdd, BddHasher> noAssumptions;
+				cacheSat(it->second, noAssumptions);
+				// Remove from temp cache
+				it = tempSatCaches.erase(it);
+				it--;
+			}
+		}
+	}
+	everAssumedSatBDDs.erase(b);
+}
+
+void rejectSatAssumption(bdd& b) {
+	// Go through tempSatCaches
+	for (std::list<std::pair<std::unordered_set<bdd, BddHasher>, bdd>>
+			::iterator it = tempSatCaches.begin();
+			it != tempSatCaches.end(); it++) {
+		// eliminate entire caches if they assumed b, as b is unsat.
+		if (it->first.count(b) == 1) {
+			it = tempSatCaches.erase(it);
+			it--;
+		}
+	}
+	everAssumedSatBDDs.erase(b);
+}
+
+
+
+
+
+

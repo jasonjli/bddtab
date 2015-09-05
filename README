@@ -1,0 +1,115 @@
+BDDTab
+A BDD-based tableau reasoner for modal logics K and S4
+by Kerry Olesen
+2014
+
+----- Requirements -------------------------------------------------------------
+BDDTab must be installed under a Linux operating system.
+
+This software relies upon an installation of the BuDDy BDD library.
+BuDDy is available here: http://sourceforge.net/projects/buddy/
+Or alternatively, can be installed on Ubuntu by the command:
+
+sudo apt-get install libbdd-dev
+
+An up to date 'g++' compiler is also required. On Ubuntu, this can be installed
+by the command:
+
+sudo apt-get install g++
+
+
+----- Installing ---------------------------------------------------------------
+
+From the directory where this README file is located, this software can be
+compiled by the command:
+
+make
+
+The BDDTab executable 'bddtab' should be created in the current directory.
+
+
+----- Using --------------------------------------------------------------------
+
+Usage: ./bddtab [-g] [-s4] [-v] [-classify]
+
+BDDTab will read one line of standard input as a modal logic formula, and
+will return whether this formula is provable or not. That is, it will negate
+the input formula, and test whether this negation is satisfiable.
+
+There are several further options:
+-g		Read a second line of input after the first, interpreting this formula as
+		global assumptions.
+
+-s4		Treat the modal logic relation as both reflexive and transitive. Assumes only one modality present.
+
+-v		Output verbose summary statistics about the internal workings of the program.
+
+-classify  Instead of determining provability of the input formula, perform a classification of all atomic formulae present. Use with -g to specify global assumptions.
+
+-buc		Use a single bdd for the Unsat cache.
+
+-nuc		Don't use an Unsat cache of any sort.
+
+-suc		Do saturation unsat caching, instead of leaf caching.
+
+-rtol		Explore saturated tableaux from right to left.
+
+-reorder		Use dynamic BDD variable reordering.
+
+-norm		Use BDDs to completely normalise formulae as a preprocessing step.
+
+*Note, not all combinations of options are supported.
+
+
+BDDTab accepts formulae in the following syntax:
+
+fml ::= '(' fml ')'                ( parentheses )
+		| 'True'                       ( truth )
+		| 'False'                      ( falsehood )
+		| '~' fml	                     ( negation )
+		| '<' id '>' fml | '<>' fml    ( diamonds )
+		| '[' id ']' fml | '[]' fml    ( boxes )
+		| fml '&' fml                  ( conjunction )
+		| fml '|' fml                  ( disjunction )
+		| fml '=>' fml                 ( implication )
+		| fml '<=>' fml                ( equivalence )
+		| id                           ( prop. var. )
+
+where identifiers (id) are arbitrary nonempty alphanumeric sequences
+(['A'-'Z' 'a'-'z' '0'-'9']+)
+
+
+----- Translating benchmarks --------------------------------------------------------------
+
+There are several benchmark sets that should available where this software was downloaded from.
+These are not in BDDTab syntax, and must be translated before BDDTab can read them.
+
+Any *.intohylo file of the 3CNFk and MQBF benchmarks can be translated using
+'intohyloToK.sh' like so, where 'filename' is the name of the file to translate:
+
+./intohyloToK.sh filename
+
+This will produce an accompanying *.intohylo.k file, which will be in BDDTab syntax.
+This file can be piped into ./bddtab to get BDDTab to test it for provability (equivalently,
+test the original for satisfiability, as this translation negates it).
+
+
+Each *.txt.Z file in the LWB benchmarks can be translated using
+'lwbToK.sh' like so, where 'filename' is the name of the file:
+
+./lwbToK.sh
+		
+This will produce an accompanying *.k file, which will contain 21 separate formulae,
+all in BDDTab syntax. Each line can be piped to ./bddtab to check that formula for provability.
+
+
+owlToMMK.jar can translate *.owl ontologies into a multi-modal K formula like so,
+where 'filename' is the name of the file:
+
+java -jar owlToMMK.jar filename > filename.k
+
+This will produce an accompanying *.k file, which can be piped to BDDTab (using -g, and as 
+the second line of input) to use as global assumptions. -classify can also be used
+to perform a classification.
+
+

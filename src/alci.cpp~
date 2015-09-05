@@ -1,0 +1,1072 @@
+/*
+ * BddReasoner - A BDD-based automated reasoner for propositional modal logic
+ * by Kerry Olesen
+ * 2013
+ *
+ * This module extends the BddReasoner approach to ALCI.
+ */
+#include "alci.h"
+
+#include <assert.h>
+
+// TODO: Stats
+// TODO: BDD unsat cache
+// TODO: Is any caching safe?
+//		Box construction instafalse is a globally unsat thing.
+//		Let's go with no for now.
+
+
+
+
+// TODO make this a little less inefficient.
+class Frontier {
+	std::list<SearchNode*> nodeList;
+	
+public:
+	void addNode(SearchNode* node) {
+		if (nodeList.size() == 0) {
+			nodeList.push_front(node);
+			return;
+		}
+		for (std::list<SearchNode*>::iterator nodeIt = nodeList.begin();
+				nodeIt != nodeList.end(); ++nodeIt) {
+			if ((*nodeIt)->getDepthForOrder() <= node->getDepthForOrder()) {
+				nodeList.insert(nodeIt, node);
+				return;
+			}
+		}
+	}
+	
+	// A bit smarter way to add a group of nodes that are all the same
+	// type and depth. (getDepthForOrder() is the same)
+	void addVector(std::vector<BoxNode*> vector) {
+		if (vector.size() == 0) {
+			return;
+		}
+		if (nodeList.size() == 0) {
+			for (std::vector<BoxNode*>::iterator it = vector.begin();
+					it != vector.end(); ++it) {
+				nodeList.push_front(*it);
+			}
+			return;
+		}
+		for (std::list<SearchNode*>::iterator nodeIt = nodeList.begin();
+				nodeIt != nodeList.end(); ++nodeIt) {
+			if ((*nodeIt)->getDepthForOrder() <= vector.front()->getDepthForOrder()) {
+				for (std::vector<BoxNode*>::iterator it = vector.begin();
+						it != vector.end(); ++it) {
+					nodeIt = nodeList.insert(nodeIt, *it);
+				}
+				return;
+			}
+		}
+	}
+	void addVector(std::vector<DiaNode*> vector) {	
+		if (vector.size() == 0) {
+			return;
+		}
+		if (nodeList.size() == 0) {
+			for (std::vector<DiaNode*>::iterator it = vector.begin();
+					it != vector.end(); ++it) {
+				nodeList.push_front(*it);
+			}
+			return;
+		}
+		for (std::list<SearchNode*>::iterator nodeIt = nodeList.begin();
+				nodeIt != nodeList.end(); ++nodeIt) {
+			if ((*nodeIt)->getDepthForOrder() <= vector.front()->getDepthForOrder()) {
+				for (std::vector<DiaNode*>::iterator it = vector.begin();
+						it != vector.end(); ++it) {
+					nodeIt = nodeList.insert(nodeIt, *it);
+				}
+				return;
+			}
+		}
+	}
+	
+	void removeNode(SearchNode* node) {
+		for (std::list<SearchNode*>::iterator nodeIt = nodeList.begin();
+				nodeIt != nodeList.end(); ++nodeIt) {
+			if (*nodeIt == node) {
+				nodeList.erase(nodeIt);
+				return;
+			}
+		}
+	}
+	
+	void removeSet(std::unordered_set<SearchNode*> set) {
+		for (std::list<SearchNode*>::iterator nodeIt = nodeList.begin();
+				nodeIt != nodeList.end(); ++nodeIt) {
+			if (set.count(*nodeIt) != 0) {
+				std::cerr << "Actually removed: " << *nodeIt << std::endl;
+				nodeIt = nodeList.erase(nodeIt);
+				--nodeIt;
+			}
+		}
+	}
+	
+	SearchNode* getFront() {
+		return nodeList.front();
+	}
+	
+	void popFront() {
+		nodeList.pop_front();
+	}
+	
+	int size() {
+		return nodeList.size();
+	}
+	
+	bool contains(SearchNode* node) {
+		for (std::list<SearchNode*>::iterator nodeIt = nodeList.begin();
+				nodeIt != nodeList.end(); ++nodeIt) {
+			if (*nodeIt == node) {
+			std::cerr << node << std::endl;
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+// List of nodes to expand, always ordered by maxDepth.
+Frontier frontier;
+
+// When doing a revert, there is a distinction between reverting children
+// and reverting restricts. Reverting a child means it should be removed
+// from the frontier, and not subsequently put back by anyone else.
+// In contrast, a restrict should be put back into the frontier, 
+// as long as it wasn't also reverted as a child.
+std::unordered_set<SearchNode*> revertedChildren;
+std::unordered_set<SearchNode*> revertedRestricts;
+std::unordered_set<World*> revertedWorlds;
+
+bool isSatisfiableALCI(bdd formulaBDD) {
+	// Construct the first world, and go for gold.
+	// Manually make a diamond node with these choices
+	World* originWorld = new World();
+	originWorld->origin = true;
+	std::cerr << "Origin world:" << originWorld << std::endl;
+	DiaNode* originNode = new DiaNode(originWorld);
+	originNode->possibilities = formulaBDD;
+	originWorld->searchNodes.push_back(originNode);
+	
+	// Do origin slightly differently. As if it was just refined.
+	// Make a new choice with your already refined choices.
+	if (!originNode->makeNewChoice()) {
+		// We have no possible alternatives, we're done.
+		delete originNode;
+		return false;
+	} else {
+		// Sweet, made a locally Sat choice, let us begin.
+	}
+	
+	while (frontier.size() != 0) {
+	
+		// take the first node from the frontier.
+		SearchNode* curNode = frontier.getFront();
+	std::cerr << "frontier popped: " << curNode << std::endl;
+		if (!curNode->origin) {
+			std::cerr << "Parent: " << curNode->parent << std::endl;
+		}
+		frontier.popFront();
+		
+		if (curNode->unapplied) {
+			// Node has not been applied yet (or has since been reverted)
+			// Attempt to apply it.
+			if (curNode->apply()) {
+				// Sick, there was a locally satisfiable choice to be made.
+				// Loop around and continue.
+			} else {
+				// Application instafalse.
+				// Then hop into standard 'I went Unsat' function
+				doUnsatStuff(curNode);
+			}
+			
+		}
+	}
+	std::cerr << "Finishing" << std::endl;
+	
+	// look at origin node to determine result:
+	bool result = (originNode->possibilities != bddfalse);
+	delete originNode;// TODO Worlds don't get deleted here, memory leak.
+				
+	return result;
+}
+
+void doUnsatStuff(SearchNode* node) {
+	std::cerr << "Doing unsat" << std::endl;
+	// Copy the restrictedBy's that we'll need to move over
+	std::unordered_set<SearchNode*> restCopy(node->restrictedBy);
+	// Copy the parent node too.
+	SearchNode* parent = node->parent;
+	// Add a restriction into the restrictedBy copy simulating the parent restriction.
+	restCopy.insert(parent);
+	
+	// If unsat node was a box, we want to tell what ever node is
+	// beneath it that it may need to do it's stolen diamonds again.
+	// Check first whether there are previous choices
+	if (node->world->searchNodes.size() > 1) {
+		node->world->searchNodes.at(node->world->searchNodes.size() - 2)->retryDiamonds();
+	}
+	
+	// Pick a restriction to refine away.
+	// Pick the restriction or Parent, with greatest maxDepth
+	int greatestRestrictionDepth = -1;
+	SearchNode* deepestRestriction;
+	for (std::unordered_set<SearchNode*, std::unordered_set<int>>::iterator restrictedIt = restCopy.begin();
+			restrictedIt != restCopy.end(); ++restrictedIt) {
+		if ((*restrictedIt)->maxDepth > greatestRestrictionDepth) {
+			greatestRestrictionDepth = (*restrictedIt)->maxDepth;
+			deepestRestriction = (*restrictedIt);
+		}
+	}
+	
+	// Refine it away, node is in an applied but unchosen state
+	deepestRestriction->refine();
+	restCopy.erase(deepestRestriction);
+	
+	// Move (recreate) the old restrictions across to the refined node.
+	for (std::unordered_set<SearchNode*>::iterator restrictedIt = restCopy.begin();
+			restrictedIt != restCopy.end(); ++restrictedIt) {
+		// Make sure you handle maxDepth correctly.
+		deepestRestriction->restrictedBy.insert(*restrictedIt);
+		if (deepestRestriction->maxDepth <= (*restrictedIt)->maxDepth) {
+			deepestRestriction->maxDepth = (*restrictedIt)->maxDepth + 1;
+		}
+		(*restrictedIt)->restricts.insert(deepestRestriction);
+	}
+	
+	// Make a new choice with your refined choices.
+	if (!deepestRestriction->makeNewChoice()) {
+		// We have no possible alternatives
+		
+		// Check here for origin node gone Unsat.
+		if (deepestRestriction->origin) {
+			// No parents to refine, we're done.
+		} else {
+			// Then hop into standard 'I went Unsat' function.
+			doUnsatStuff(deepestRestriction);
+		}
+	} else {
+		// Sweet, made a locally Sat choice, unsat refining done.
+	}
+}
+
+
+bool SearchNode::makeNewChoice() {
+
+	std::cerr << "Making choice" << std::endl;
+	if (possibilities == bddfalse) {
+		choice = bddfalse;
+		return false;// No possible choice to make.
+	} else if (possibilities == bddtrue) {
+		choice = bddtrue;
+		return true;// Vacuous choice. Will this ever get used?
+	}
+	
+	// Check if previous world choice had imitators.
+	if (!world->imitators.empty()) {
+		// Tell them elvis has moved on.
+		std::cerr << "Shaking imitators of: " << world;
+		shakeImitators(world);
+	}
+	
+	// Check if previous world choice was an imitator
+	if (world->imitating != NULL) {
+		// 'Reinstantiate' the child choices that were annulled when it imitated.
+		std::cerr << "stopping imitating: " << world;
+		world->imitating->imitators.erase(world);
+		stopImitating(world);
+	}
+	
+	
+	// Get new box nodes and diamond nodes, add them to the frontier.
+	if (rightToLeft) {
+		choice = rightValuation(possibilities);
+	} else {
+		choice = bdd_satone(possibilities);
+	}
+	std::cerr << "Choice made: " << choice.id() << std::endl;
+	// Make sets of the modal vars in the satisfying valuation.
+	std::vector<int> allBoxVars;
+	std::vector<int> allDiaVars;
+  extractSatisfyingModalVars(choice, allBoxVars, allDiaVars);
+  
+	
+  // Find all the box vars added by this choice, and reserve them so that they are
+  // not processed if some part of the process comes back to this world before us.
+  std::vector<int> newBoxVars;
+  for (std::vector<int>::iterator boxIt = allBoxVars.begin();
+  		boxIt != allBoxVars.end(); ++boxIt) {
+  	if (world->reservedBoxVars.count(*boxIt) == 0) {
+  		newBoxVars.push_back(*boxIt);
+  		world->reservedBoxVars.insert(*boxIt);// Reserve them against depth-first trying to do them first.
+  	}
+  }
+	
+	
+	// Create new box nodes.
+	// Go through every current edge
+	for (std::vector<Edge>::iterator edgeIt = world->edges.begin();
+			edgeIt != world->edges.end(); ++edgeIt) {
+		
+		// Get all the newly reserved boxes for that edge's role
+		std::vector<int> roleBoxVars;
+		for (std::vector<int>::iterator boxIt = newBoxVars.begin();
+				boxIt != newBoxVars.end(); ++boxIt) {
+			if (varsToAtoms.at(*boxIt)->getrole() == (*edgeIt).role) {// Role must match the edge we are considering.
+				roleBoxVars.push_back(*boxIt);
+			}// End edge matches
+		}// End getting relevant boxes.
+		
+		if (!roleBoxVars.empty()) {
+			BoxNode* boxNode =
+					new BoxNode(this, maxDepth + 1, (*edgeIt).otherWorld, roleBoxVars);
+			boxChildren.push_back(boxNode);
+		}
+	}// End creating box nodes.
+	
+	// Create new diamond nodes.
+	for (std::vector<int>::iterator diaIt = allDiaVars.begin();
+			diaIt != allDiaVars.end(); ++diaIt) {
+		DiaNode* diaNode = new DiaNode(this, maxDepth + 1, *diaIt);
+		diaChildren.push_back(diaNode);
+		
+	}// End creating diamond nodes.
+	
+	
+	// Add all those to the frontier
+	frontier.addVector(diaChildren);
+	frontier.addVector(boxChildren);	
+	
+	// Check if this new choice is just an imitator.
+	// Walk back along all parent edges, check if their choice == our choice.
+	World* ancestorWorld = world;
+	World* imitatingWorld = NULL;
+	
+	assert(!chilled);
+	assert(origin || world == parent->world->edges.front().otherWorld || !parent->chilled);
+	std::vector<int> v;
+	while (!ancestorWorld->origin) {
+		for(std::vector<int>::iterator it = v.begin(); it != v.end(); ++it) {
+			if (!(ancestorWorld->choice().id() != *it || ancestorWorld->choice().id() == world->choice().id())) {
+				std::cerr << "Pending new choice: " << this << " " <<world->choice().id() << std::endl;
+				std::cerr << "Ancestry: " << std::endl;
+				for (std::vector<int>::iterator i = v.begin(); i != v.end(); ++i) {
+					std::cerr << *i << std::endl;
+				}
+				std::cerr << "Duplicate W: " << ancestorWorld << " : " << ancestorWorld->choice().id() << std::endl;
+				SearchNode* parentNode = parent;
+				while (!parentNode->origin) {
+					std::cerr << parentNode << " : " << parentNode->chilled << " self: " << parentNode->choice.id() << 
+					" worldchoice: " << parentNode->world->choice().id() 
+					<< " world: " << parentNode->world << std::endl;
+					parentNode = parentNode->parent;
+				}
+				
+			}
+			assert(ancestorWorld->choice().id() != *it || ancestorWorld->choice().id() == world->choice().id());
+		}
+		v.push_back(ancestorWorld->choice().id());
+		ancestorWorld = ancestorWorld->edges.front().otherWorld;
+	}
+	ancestorWorld = world;
+	while (!ancestorWorld->origin) {
+		std::cerr << ancestorWorld->edges.front().otherWorld->searchNodes.back() << " " <<
+				ancestorWorld->edges.front().otherWorld->choice().id() << std::endl;
+		if (ancestorWorld->edges.front().otherWorld->choice() == world->choice()) {
+			imitatingWorld = ancestorWorld->edges.front().otherWorld;
+			break;
+		} else {
+			ancestorWorld = ancestorWorld->edges.front().otherWorld;
+		}
+	}
+	if (imitatingWorld != NULL) {
+	std::cerr << "Imitator: " << this << std::endl;
+		// Note that you're world is an imitator
+		world->imitating = imitatingWorld;
+		// Tell that world that you're an imitator
+		world->imitating->imitators.insert(world);
+		// Tell every SearchNode at this world that they should chill out.
+		// Go through all their children and tell them: "Guys chill out, I'm already being dealt with."
+		// Ie remove all leaves from the frontier, except for ones going across the parent edge.
+		// Those ones are important.
+		for (std::vector<SearchNode*>::iterator searchIt = world->searchNodes.begin();
+				searchIt != world->searchNodes.end(); ++searchIt) {
+			(*searchIt)->chillOutChildChoices(world, world->edges.front().otherWorld);
+		}
+	}
+	
+	return true;
+}
+
+bool DiaNode::apply() {
+	std::cerr << "aaplying dia" << std::endl;
+	// Dia nodes are going to be `stolen' if a box comes back to the fromWorld
+	// before the original choice gets to apply the diamond.
+	// We must check here whether this diamond has been applied already.
+	if (parent->world->appliedDiaVars.count(diaVar) != 0) {
+	std::cerr << "stolen" << std::endl;
+		// Do nothing, this diamond has been `stolen', already applied,
+		// and must have been satisfiable if we made it to here.
+		// Note unapplied left false here, so we can later tell we were stolen.
+		stolen = true;
+		return true;
+	} else {
+	std::cerr << "not stolen" << std::endl;
+		// Note that we have applied this diamond.
+		parent->world->appliedDiaVars.insert(diaVar);
+		unapplied = false;
+		stolen = false;
+		// Create a new world, put in the edges, then make a choice.
+		// Construct the choices at this new world:
+		int diaRole = varsToAtoms.at(diaVar)->getrole();
+		possibilities = gammaBDD & undiamond(diaVar);// Note: gamma is included here.
+		// Iterating like this will include boxes added as a consequence of
+		// `previous' boxes and diamonds.
+	std::vector<int> allBoxVars = parent->world->curBoxVars();
+		for (std::vector<int>::iterator boxIt = allBoxVars.begin();
+				boxIt != allBoxVars.end(); ++boxIt) {
+			if (varsToAtoms.at(*boxIt)->getrole() == diaRole) {
+				possibilities = possibilities & unbox(*boxIt);
+				boxVars.push_back(*boxIt);
+			}
+		}
+	
+		// Create a new world.
+		world = new World();
+		parent->world->edges.emplace_back(varsToAtoms.at(diaVar)->getrole(), world);
+		world->edges.emplace_back(-varsToAtoms.at(diaVar)->getrole(), parent->world);
+		world->searchNodes.push_back(this);
+
+		// Go pick one of the possible choices.
+		return makeNewChoice();
+	}// End not stolen
+}
+
+
+
+bool BoxNode::apply() {
+	std::cerr << "aaplying box" << std::endl;
+	for (std::vector<SearchNode*>::iterator it = world->searchNodes.begin();
+			it != world->searchNodes.end(); ++it) {
+		
+	std::cerr << *it << std::endl;
+	}
+	unapplied = false;
+	
+	// Build the choices out of boxVars
+	possibilities = bddtrue;
+	std::cerr << "Box vars: ";
+	for (std::vector<int>::iterator boxIt = boxVars.begin();
+			boxIt != boxVars.end(); ++boxIt) {
+		std::cerr << *boxIt << " ";
+		possibilities = possibilities & unbox(*boxIt);
+	}
+	if (possibilities == bddfalse) {
+		// Box construction instafalse.
+		// Don't add any restrictions, don't bother trying to make a choice,
+		// the lack of restrictions will signify a construction instafalse.
+		world->searchNodes.push_back(this);
+		return false;
+	}
+	possibilities = possibilities & world->choice();
+	
+	// TODO pretty sure the diamond should always get a restrict edge
+	// "if you didn't exist then I couldn't ahve gone unsat."
+	// Add restriction edges from all previous nodes on this world.
+	// Restriction edges get resVars that are any children of the box vars.
+	// Go get all box var children.
+	for (std::vector<SearchNode*>::iterator searchIt = world->searchNodes.begin();
+			searchIt != world->searchNodes.end(); ++searchIt) {
+		// Create a restriction edge with those as res vars.
+		restrictedBy.insert(*searchIt);
+		(*searchIt)->restricts.insert(this);
+		// Make sure maxDepth is correct
+		if ((*searchIt)->maxDepth >= maxDepth) {
+			maxDepth = (*searchIt)->maxDepth + 1;
+		}
+	}
+	
+	
+	// Vacuous boxes are pretty annoying, disrupting imitators, but not changing the world.
+	if (possibilities == world->choice()) {
+		// Don't bother going through the makeChoice thing, let everyone else handle it.
+		vacuous = true;
+		choice = world->choice();
+		world->searchNodes.push_back(this);
+		return true;
+	}
+	
+	world->searchNodes.push_back(this);
+	
+	return makeNewChoice();
+}
+
+
+void SearchNode::refine() {
+	std::cerr << "Refining node:" << this << std::endl;
+	// Annoyingly close to being a full revert... but different.
+	// We want to leave our current world intact, apart from popping the last choice we
+	// made.
+	// So copy-paste revert and edit it a little, I guess...
+	
+	// Clear away your children, your children's children.
+	// Things you are restricted by should stay. They only disappear when
+	// you go unsat / get reverted (unsats will get reverted).
+	
+	if (!(origin || world == parent->world->edges.front().otherWorld || !parent->chilled)) {
+			std::cerr << "Refining parent bad chilled! me: " << this << std::endl;
+			std::cerr << "World: " << world << std::endl;
+			std::cerr << "Parent Ndoes parent world: " << parent->world->edges.front().otherWorld << std::endl;
+			std::cerr << "Parent's chilled: " << parent->chilled << std::endl;
+	}
+	assert(origin || world == parent->world->edges.front().otherWorld || !parent->chilled);
+	if (chilled) {
+		std::cerr << "Starting whipping: " << this << std::endl;
+		for (std::vector<SearchNode*>::iterator searchIt = world->searchNodes.begin();
+				searchIt != world->searchNodes.end(); ++searchIt) {
+			(*searchIt)->whipChildrenBackToWork(world, world->edges.front().otherWorld);
+		}
+	}
+	std::cerr << "Refining2:" << std::endl;
+	
+	// Revert global states.
+	revertedChildren.clear();
+	revertedRestricts.clear();
+	revertedWorlds.clear();
+	
+	// Just to tell everyone else that we've definitely been reverted already,
+	revertedChildren.insert(this);
+	revertedWorlds.insert(world);
+	
+	for (std::unordered_set<SearchNode*>::iterator resIt = restricts.begin();
+			resIt != restricts.end(); ++resIt) {
+		if (revertedRestricts.count(*resIt) != 0 || revertedChildren.count(*resIt) != 0) {
+			// You have been reverted by someone else already, and added to the
+			// appropriate set.
+		} else {
+			// Remember I want to add you to the frontier.
+			revertedRestricts.insert(*resIt);
+			// And go revert you.
+			(*resIt)->revert();
+		}
+	}
+	restricts.clear();
+	std::cerr << "Refining3:" << std::endl;
+	
+	for (std::vector<DiaNode*>::iterator diaIt = diaChildren.begin();
+			diaIt != diaChildren.end(); ++diaIt) {
+		if (revertedRestricts.count(*diaIt) != 0) {
+			// Well, it's my child, so it shouldn't be there.
+			revertedRestricts.erase(*diaIt);
+		}
+		revertedChildren.insert(*diaIt);
+		(*diaIt)->revert();
+	}
+	std::cerr << "Refining31:" << std::endl;
+	for (std::vector<BoxNode*>::iterator boxIt = boxChildren.begin();
+			boxIt != boxChildren.end(); ++boxIt) {
+		if (revertedRestricts.count(*boxIt) != 0) {
+			// Well, it's my child, so it shouldn't be there.
+			revertedRestricts.erase(*boxIt);
+	std::cerr << "Refining311:" << std::endl;
+		}
+	std::cerr << "Refining312:" << std::endl;
+		// Get it's box vars, and unreserve them.
+		for (std::vector<int>::iterator varIt = (*boxIt)->boxVars.begin();
+				varIt != (*boxIt)->boxVars.end(); ++varIt) {
+	std::cerr << "Refining313:" << std::endl;
+			world->reservedBoxVars.erase(*varIt);
+		}
+	std::cerr << "Refining314:" << std::endl;
+		revertedChildren.insert(*boxIt);
+		(*boxIt)->revert();
+	}
+	std::cerr << "Refining32:" << std::endl;
+	// Don't clear these yet, that'll be done in destroyChildren().
+	if (!origin) {// Origin node has no parent
+		maxDepth = parent->maxDepth + 1;
+	}
+	std::cerr << "Refining33:" << std::endl;
+	
+	if (world->imitating != NULL) {
+		if (revertedWorlds.count(world->imitating) == 0) {
+			// The thing we were imitating has not been reverted,
+			// go tell it we're sorry.
+			world->imitating->imitators.erase(world);
+		}
+	}
+	world->imitating = NULL;
+	// Children will be reverted before us.
+	world->imitators.clear();
+	
+	std::cerr << "Refining4:" << std::endl;
+	// Go add all the reverted restricts to the frontier
+	for (std::unordered_set<SearchNode*>::iterator addIt = revertedRestricts.begin();
+			addIt != revertedRestricts.end(); ++addIt) {
+		frontier.addNode(*addIt);
+		(*addIt)->destroyChildren();
+	}
+	destroyChildren();
+	
+	// Go through reverted worlds, and now whip any that were chilled.
+	// What if it was vacuous? Don't add it to reverted Worlds.
+	// Except don't bother with this world, we've handled that excplicitly above.
+	revertedWorlds.erase(world);
+	for (std::unordered_set<World*>::iterator revWorldIt = revertedWorlds.begin();
+			revWorldIt != revertedWorlds.end(); ++revWorldIt) {
+		if ((*revWorldIt)->searchNodes.back()->chilled) {
+			for (std::vector<SearchNode*>::iterator searchIt = (*revWorldIt)->searchNodes.begin();
+					searchIt != (*revWorldIt)->searchNodes.end(); ++searchIt) {
+				(*searchIt)->whipChildrenBackToWork((*revWorldIt), (*revWorldIt)->edges.front().otherWorld);
+			}
+		}
+		// IO need to recheck duplicates here. Something above you got refined,
+		// you got whipped, but now you're a duplicate.
+		World* ancestorWorld = (*revWorldIt);
+		World* imitatingWorld = NULL;
+		while (!ancestorWorld->origin) {
+			if (ancestorWorld->edges.front().otherWorld->choice() == (*revWorldIt)->choice()) {
+				imitatingWorld = ancestorWorld->edges.front().otherWorld;
+				break;
+			} else {
+				ancestorWorld = ancestorWorld->edges.front().otherWorld;
+			}
+		}
+		if (imitatingWorld != NULL) {
+		std::cerr << "Imitating after refinement: " << (*revWorldIt)->searchNodes.back() << std::endl;
+			// Note that your world is an imitator
+			(*revWorldIt)->imitating = imitatingWorld;
+			// Tell that world that you're an imitator
+			(*revWorldIt)->imitating->imitators.insert((*revWorldIt));
+			// Tell every SearchNode at this world that they should chill out.
+			// Go through all their children and tell them: "Guys chill out, I'm already being dealt with."
+			// Ie remove all leaves from the frontier, except for ones going across the parent edge.
+			// Those ones are important.
+			for (std::vector<SearchNode*>::iterator searchIt = (*revWorldIt)->searchNodes.begin();
+					searchIt != (*revWorldIt)->searchNodes.end(); ++searchIt) {
+				(*searchIt)->chillOutChildChoices((*revWorldIt), (*revWorldIt)->edges.front().otherWorld);
+			}
+		}
+	}
+	
+	// Perform the refinement. Choice will be made after this function returns.
+	bdd refinement = !choice;
+	
+	possibilities = possibilities & refinement;
+	
+	
+}
+
+
+void SearchNode::destroyChildren() {
+	for (std::vector<DiaNode*>::iterator diaIt = diaChildren.begin();
+			diaIt != diaChildren.end(); ++diaIt) {
+		delete (*diaIt);
+	}
+	diaChildren.clear();
+	for (std::vector<BoxNode*>::iterator boxIt = boxChildren.begin();
+			boxIt != boxChildren.end(); ++boxIt) {
+		delete (*boxIt);
+	}
+	boxChildren.clear();
+}
+
+DiaNode::~DiaNode() {
+	assert(!frontier.contains(this));
+	std::cerr << "Deleting dia: " << this << std::endl;
+	// TODO during operation, revert things before you destroy them
+	// At the end, you can just destroy them.
+	// Destruction will do nothing fancy, simply destroy all child pointers that
+	// we're responsible for.
+	destroyChildren();
+	if (!unapplied) {
+	std::cerr << "Deleting world: " << world << std::endl;
+		delete world;// unapplied check is for whether we've been reverted before deletion
+		// and so whether we've deleted the world or not.
+	}
+}
+
+BoxNode::~BoxNode() {
+	assert(!frontier.contains(this));
+	std::cerr << "Deleting box: " << this << std::endl;
+	// At the end, you can just destroy them.
+	// Destruction will do nothing fancy, simply destroy all child pointers that
+	// we're responsible for.
+	destroyChildren();
+}
+
+/*
+ * Put yourself back to the exact state you were when you were constructed.
+ * Revert any changes you made to the model graph.
+ * This is not the place for deleting nodes though. That will be done separately
+ * in some deleteChildren function.
+ * This is reverting as if you were going to be put back in the frontier.
+ */
+void DiaNode::revert() {
+	if (unapplied && !stolen) {
+		// We may be in the frontier, remove ourselves.
+		// Alternatively, we may be chilled, in which case we're not in the frontier.
+		if (!chilled) {
+			frontier.removeNode(this);
+		}
+		
+		chilled = false;
+	} else if (unapplied && stolen) {
+		// Very little for us to do. We were stolen, so we didn't do anything,
+		// and we're not in the frontier.
+		stolen = false;
+	} else {
+		revertedWorlds.insert(world);
+		
+		// A reverting dia node whipping children is silly.
+		// A Reverting dia node will definitely delete all of its children.
+		
+		for (std::unordered_set<SearchNode*>::iterator resIt = restricts.begin();
+				resIt != restricts.end(); ++resIt) {
+			if (revertedRestricts.count(*resIt) != 0 || revertedChildren.count(*resIt) != 0) {
+				// You have been reverted by someone else already, and added to the
+				// appropriate set.
+			} else {
+				// Remember I want to add you to the frontier.
+				revertedRestricts.insert(*resIt);
+				// And go revert you.
+				(*resIt)->revert();
+			}
+		}
+		restricts.clear();
+		
+		for (std::vector<DiaNode*>::iterator diaIt = diaChildren.begin();
+				diaIt != diaChildren.end(); ++diaIt) {
+			if (revertedRestricts.count(*diaIt) != 0) {
+				// Well, it's my child, so it shouldn't be there.
+				revertedRestricts.erase(*diaIt);
+			}
+			revertedChildren.insert(*diaIt);
+			(*diaIt)->revert();
+		}
+		for (std::vector<BoxNode*>::iterator boxIt = boxChildren.begin();
+				boxIt != boxChildren.end(); ++boxIt) {
+			if (revertedRestricts.count(*boxIt) != 0) {
+				// Well, it's my child, so it shouldn't be there.
+				revertedRestricts.erase(*boxIt);
+			}
+			// Get it's box vars, and unreserve them.
+			for (std::vector<int>::iterator varIt = (*boxIt)->boxVars.begin();
+					varIt != (*boxIt)->boxVars.end(); ++varIt) {
+				world->reservedBoxVars.erase(*varIt);
+			}
+			revertedChildren.insert(*boxIt);
+			(*boxIt)->revert();
+		}
+		// TODO check frontier considerations.
+		// Don't clear these yet, that'll be done in destroyChildren().
+		
+		for (std::unordered_set<SearchNode*>::iterator
+				resIt = restrictedBy.begin();
+				resIt != restrictedBy.end(); ++resIt) {
+			if (revertedRestricts.count(*resIt) != 0
+			|| revertedChildren.count(*resIt) != 0) {
+				// You're in one of the sets, I don't need to do anything.
+			} else {
+				// You have not begun to be reverted yet, so let me remove your restrict
+				// to me, as I don't exist anymore.
+				(*resIt)->restricts.erase(this);
+			}
+		}
+		restrictedBy.clear();
+		
+		unapplied = true;
+		
+		maxDepth = parent->maxDepth + 1;// Generally this won't be correct, due to
+								// the order in which stuff is done, but we only care for
+								// the original node and revertedRestricts, for which it will
+								// be correct, as their parents won't change.
+		
+		boxVars.clear();// You pick up boxVars on application.
+		
+		if (world->imitating != NULL) {
+			if (revertedWorlds.count(world->imitating) == 0) {
+				// The thing we were imitating has not been reverted,
+				// go tell it we're sorry.
+				world->imitating->imitators.erase(world);
+			}
+		}
+		world->imitating = NULL;
+		// Children will be reverted before we are.
+		world->imitators.clear();
+		
+		refinedVars.clear();
+		
+		stolen = false;
+		
+		// World should be deleted here I think. TODO check this.
+		delete world;
+		revertedWorlds.erase(world);// Don't leave
+		// Parent world needs to be reverted too.
+		parent->world->edges.pop_back();//TODO is this the right edge? is this good enough?
+		parent->world->appliedDiaVars.erase(diaVar);
+	}
+}
+
+// TODO massive duplicate of DiaNode, except for world stuff.
+void BoxNode::revert() {
+	std::cerr << "Revert:" << std::endl;
+	if (unapplied) {
+		// We may be in the frontier. Find us and get out.
+		// Alternatively, we may be chilled, in which case we're not in the frontier.
+		if (!chilled) {
+			frontier.removeNode(this);
+		}
+		chilled = false;
+	} else {
+		if (!vacuous) {
+			revertedWorlds.insert(world);
+		}
+	std::cerr << "Revert1:" << std::endl;
+	
+		chilled = false;// stuff handled in refine();
+	
+		for (std::unordered_set<SearchNode*>::iterator resIt = restricts.begin();
+				resIt != restricts.end(); ++resIt) {
+			if (revertedRestricts.count(*resIt) != 0 || revertedChildren.count(*resIt) != 0) {
+				// You have been reverted by someone else already, and added to the
+				// appropriate set.
+			} else {
+				// Remember I want to add you to the frontier.
+				revertedRestricts.insert(*resIt);
+				// And go revert you.
+				(*resIt)->revert();
+			}
+		}
+		restricts.clear();
+	std::cerr << "Revert2:" << std::endl;
+		
+		for (std::vector<DiaNode*>::iterator diaIt = diaChildren.begin();
+				diaIt != diaChildren.end(); ++diaIt) {
+			if (revertedRestricts.count(*diaIt) != 0) {
+				// Well, it's my child, so it shouldn't be there.
+				revertedRestricts.erase(*diaIt);
+			}
+			revertedChildren.insert(*diaIt);
+			(*diaIt)->revert();
+		}
+		for (std::vector<BoxNode*>::iterator boxIt = boxChildren.begin();
+				boxIt != boxChildren.end(); ++boxIt) {
+			if (revertedRestricts.count(*boxIt) != 0) {
+				// Well, it's my child, so it shouldn't be there.
+				revertedRestricts.erase(*boxIt);
+			}
+			// Get it's box vars, and unreserve them.
+			for (std::vector<int>::iterator varIt = (*boxIt)->boxVars.begin();
+					varIt != (*boxIt)->boxVars.end(); ++varIt) {
+				world->reservedBoxVars.erase(*varIt);
+			}
+			revertedChildren.insert(*boxIt);
+			(*boxIt)->revert();
+		}
+	std::cerr << "Revert3:" << std::endl;
+		// TODO check frontier considerations.
+		// Don't clear these yet, that'll be done in destroyChildren().
+		
+		for (std::unordered_set<SearchNode*>::iterator
+				resIt = restrictedBy.begin();
+				resIt != restrictedBy.end(); ++resIt) {
+			if (revertedRestricts.count(*resIt) != 0
+			|| revertedChildren.count(*resIt) != 0) {
+				// You're in one of the sets, I don't need to do anything.
+			} else {
+				// You have not begun to be reverted yet, so let me remove your restrict
+				// to me, as I don't exist anymore.
+				(*resIt)->restricts.erase(this);
+			}
+		}
+		restrictedBy.clear();
+		
+		unapplied = true;
+		
+	std::cerr << "Revert4:" << std::endl;
+		maxDepth = parent->maxDepth + 1;// Generally this won't be correct, due to
+								// the order in which stuff is done, but we only care for
+								// the original node and revertedRestricts, for which it will
+								// be correct, as their parents won't change.
+		
+		if (world->imitating != NULL) {
+			if (revertedWorlds.count(world->imitating) == 0) {
+				// The thing we were imitating has not been reverted,
+				// go tell it we're sorry.
+				world->imitating->imitators.erase(world);
+			}
+		}
+		world->imitating = NULL;
+		// Children will be reverted before us, and imitators are children.
+		world->imitators.clear();
+		
+		refinedVars.clear();
+		
+		vacuous = false;
+		
+		// World considerations:
+		world->searchNodes.pop_back();
+	}
+}
+
+void SearchNode::retryDiamonds() {
+	
+	for (std::vector<DiaNode*>::iterator diaChildIt = diaChildren.begin();
+			diaChildIt != diaChildren.end(); ++diaChildIt) {
+		// Find those that tried to apply but were stolen, and may now be free.
+		if ((*diaChildIt)->stolen) {
+			// put them back into the frontier, 
+			frontier.addNode(*diaChildIt);
+			(*diaChildIt)->stolen = false;
+		}
+	}
+}
+
+
+/*
+ * FromWorld and ToWorld designate the edge beyond which no chilling shall be done.
+ */
+void SearchNode::chillOutChildChoices(World* fromWorld, World* toWorld) {
+std::cerr << "chilling me out: " << this << std::endl;
+	if (chilled) {
+std::cerr << "was chilled" << std::endl;
+		// If they're a sub world of the original world, then their chill is
+		// lame and invalid.
+		if (world != fromWorld) {
+std::cerr << "was different world" << std::endl;
+			// So you have to make sure you re-chill things which you previously ignored
+			// over the now invalid chill edge.
+			for (std::vector<BoxNode*>::iterator boxIt = boxChildren.begin();
+					boxIt != boxChildren.end(); ++boxIt) {
+				if ((*boxIt)->world == world->edges.front().otherWorld) {
+					std::cerr << "Rechilling box child: " << *boxIt << std::endl;
+					if ((*boxIt)->unapplied == true) {
+						std::cerr << "Removing from frontier: " << *boxIt << std::endl;
+						frontier.removeNode(*boxIt);
+					} else {
+						// Find things which have been applied, and get them to chill with their children.
+						(*boxIt)->chillOutChildChoices(fromWorld, toWorld);
+					}
+				} else {
+					// they would have been chilled already.
+				}
+			}
+			if (world->imitating != NULL) {
+				world->imitating->imitators.erase(world);
+				world->imitating = NULL;
+			}
+		}
+		return;
+	}
+std::cerr << "wasn't chilled yet" << std::endl;
+	chilled = true;
+	std::unordered_set<SearchNode*> removeFromFrontier;
+	for (std::vector<BoxNode*>::iterator boxIt = boxChildren.begin();
+			boxIt != boxChildren.end(); ++boxIt) {
+			std::cerr << "looking at box child: " << *boxIt << std::endl;
+		if (world == fromWorld && (*boxIt)->world == toWorld) {
+			// At all times, don't do any chilling to things that go across the given edge.
+			std::cerr << "Goes over parent edge to: " << (*boxIt)->world << std::endl;
+		} else {
+			// Find things that are sitting in the frontier, and remove them from the frontier.
+			if ((*boxIt)->unapplied == true) {
+			std::cerr << "Removing from frontier: " << *boxIt << std::endl;
+				removeFromFrontier.insert(*boxIt);
+			} else {
+				// Find things which have been applied, and get them to chill with their children.
+				(*boxIt)->chillOutChildChoices(fromWorld, toWorld);
+			}
+		}
+	}
+	for (std::vector<DiaNode*>::iterator diaIt = diaChildren.begin();
+			diaIt != diaChildren.end(); ++diaIt) {
+			std::cerr << "looking at dia child: " << *diaIt << std::endl;
+		// No diamond can go across the given edge, as it is the parent edge of the original node.
+		// and thus not a child diamond.
+		// Find things that are sitting in the frontier, and remove them from the frontier.
+		if ((*diaIt)->unapplied == true && (*diaIt)->stolen == false) {
+			std::cerr << "Removing from frontier: " << *diaIt << std::endl;
+			removeFromFrontier.insert(*diaIt);
+		} else {
+			// Find things which have been applied and/or stolen, and get them to chill with their children.
+			(*diaIt)->chillOutChildChoices(fromWorld, toWorld);
+		}
+	}
+	// Walk the frontier, removing stuff.
+	frontier.removeSet(removeFromFrontier);
+}
+
+
+void SearchNode::whipChildrenBackToWork(World* fromWorld, World* toWorld) {
+	std::cerr << "Whipping me: " << this << std::endl;
+	if (!chilled) {
+		return;
+	}
+	chilled = false;
+	std::vector<BoxNode*> addBoxesToFrontier;
+	std::vector<DiaNode*> addDiasToFrontier;
+	for (std::vector<BoxNode*>::iterator boxIt = boxChildren.begin();
+			boxIt != boxChildren.end(); ++boxIt) {
+		if (world == fromWorld && (*boxIt)->world == toWorld) {
+			// At all times, don't bother whipping across the given edge, they were never lazified.
+		} else {
+			// Find things that would have been removed from the frontier.
+			if ((*boxIt)->unapplied == true) {
+			std::cerr << "Adding from frontier: " << *boxIt << std::endl;
+				addBoxesToFrontier.push_back(*boxIt);
+			} else {
+				// Find things which were not removed, but go whip their children.
+				(*boxIt)->whipChildrenBackToWork(fromWorld, toWorld);
+			}
+		}
+	}
+	for (std::vector<DiaNode*>::iterator diaIt = diaChildren.begin();
+			diaIt != diaChildren.end(); ++diaIt) {
+		// No diamond can go across the given edge, as it is the parent edge of the original node.
+		// and thus not a child diamond.
+		// Find things that would have been removed from the frontier.
+		if ((*diaIt)->unapplied == true && (*diaIt)->stolen == false) {
+			std::cerr << "adding from frontier: " << *diaIt << std::endl;
+			addDiasToFrontier.push_back(*diaIt);
+		} else {
+			// Find things which were not removed, but go whip their children.
+			(*diaIt)->whipChildrenBackToWork(fromWorld, toWorld);
+		}
+	}
+	// Walk the things we found, adding them back to the frontier.
+	frontier.addVector(addDiasToFrontier);
+	frontier.addVector(addBoxesToFrontier);
+}
+
+void shakeImitators(World* world) {
+	// Go 'reinstantiate' the imitator choices.
+	for (std::unordered_set<World*>::iterator imIt = world->imitators.begin();
+			imIt != world->imitators.end(); ++imIt) {
+		stopImitating(*imIt);
+	}
+	world->imitators.clear();
+}
+
+
+void stopImitating(World* world) {
+	// Don't tell the real slim shady you're sorry. He knows.
+	world->imitating = NULL;
+	// Take it out on all the children of SearchNodes at this world.
+	for (std::vector<SearchNode*>::iterator searchIt = world->searchNodes.begin();
+				searchIt != world->searchNodes.end(); ++searchIt) {
+		(*searchIt)->whipChildrenBackToWork(world, world->edges.front().otherWorld);
+	}
+}
+
+std::vector<int> World::curBoxVars() {
+	std::vector<int> dias;
+	std::vector<int> boxes;
+	extractSatisfyingModalVars(choice(), boxes, dias);
+	return boxes;
+}
+
+

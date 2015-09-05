@@ -1,0 +1,194 @@
+/*
+ * BDDTab - A BDD-based tableau reasoner for propositional modal logic
+ * by Kerry Olesen
+ * 2013
+ */
+
+#ifndef _BDDTAB_H_
+#define _BDDTAB_H_
+
+#include "KFormula.h"
+#include <bdd.h>
+#include <iostream>
+#include <assert.h>
+#include <map>
+#include <unordered_map>
+#include <unordered_set>
+#include <algorithm>
+#include <unistd.h>
+#include <deque>
+#include <vector>
+#include <list>
+#include <cstring>
+#include <sys/resource.h>
+
+
+// Hasher class for unordered_maps and unordered_sets of bdds:
+class BddHasher {
+	public:
+		size_t operator()(const bdd& b) const {
+			return b.id();
+		}
+};
+
+// ------------------------ Function Declarations --------------------------- //
+void processArgs(int argc, char * argv[]);
+void printUsage();
+void printSummaryStatistics();
+bool kformulaComp(const KFormula* f1, const KFormula* f2);
+KFormula* toBoxNNF(KFormula* f);
+void findAllRoles(KFormula* f, std::unordered_set<std::string>& roles);
+void assignRoleInts(std::unordered_set<std::string>& roles,
+		std::unordered_map<std::string, int>& roleMap);
+void applyRoleInts(KFormula* f, std::unordered_map<std::string, int>& roleMap);
+void relateAtomsAndBDDVars(std::vector<KFormula*>& atoms, std::deque<KFormula*>& formulae);
+std::unordered_set<int>& getChildren(int var);
+void computeChildren(const KFormula* formula, std::unordered_set<int>& children);
+void computeChildrenBoxS4(const KFormula* formula, std::unordered_set<int>& children);
+bdd toBDD(const KFormula* formula);
+void performClassification();
+bool isSatisfiable(bdd formulaBDD);
+bool isSatisfiableK(bdd formulaBDD, std::unordered_set<int>& responsibleVars,
+				   std::unordered_set<bdd, BddHasher>& assumedSatBDDs);
+void extractSatisfyingModalVars(bdd satValuation,
+								std::vector<int>& extBoxVars,
+								std::vector<int>& extDiaVars);
+bool refineAndRecurse(bdd& unsatBDD, bdd& formulaBDD, std::unordered_set<int>& responsibleVars,
+					  std::unordered_set<bdd, BddHasher>& assumedSatBDDs);
+void cacheSat(bdd& b, std::unordered_set<bdd, BddHasher>& assumedSatBDDs);
+void cacheUnsat(std::unordered_set<int>& vars, bdd& b);
+bool shareAnElement(const std::unordered_set<int>& firstSet,
+					const std::unordered_set<int>& secondSet);
+std::unordered_set<int> getModalVars(bdd& b);
+void extractModalVars(bdd support, std::unordered_set<int>& modalVars);
+bool isSubset(std::vector<int> vector, std::unordered_set<int>& set);
+void confirmSatAssumption(bdd& b);
+void rejectSatAssumption(bdd& b);
+
+bool refineAndRecurseS4(bdd& unsatBDD, bdd& formulaBDD,
+						std::unordered_set<int>& responsibleVars,
+						std::unordered_set<bdd, BddHasher>& assumedSatBDDs,
+						bdd& permanentFactsBDD,
+						std::unordered_set<int>& permanentBoxVars);
+bool isSatisfiableS4(bdd formulaBDD, std::unordered_set<int>& responsibleVars,
+					 std::unordered_set<bdd, BddHasher>& assumedSatBDDs,
+					 bdd permanentFactsBDD,
+					 std::unordered_set<int> permanentBoxVars);
+void extractAllVars(bdd satValuation,
+					std::vector<std::pair<int, bool>>& satValVars);
+bdd leftValuation(bdd b);
+bdd rightValuation(bdd b);
+bdd unbox(int var);
+bdd undiamond(int var);
+bdd unboxS4(int var);
+
+
+// ----------------------- Global variable declarations --------------------- //
+// Correspondence between KFormulae and BDD variables:
+extern bool(*compareptr)(const KFormula*, const KFormula*);
+extern std::map<const KFormula*, int, bool(*)(const KFormula*,const KFormula*)> atomsToVars;
+extern std::vector<const KFormula*> varsToAtoms;
+
+// Correspondence between modal BDD variables (/formulae) and their 'children' variables (/formulae).
+extern std::vector<std::unordered_set<int>> varsToChildren;
+
+// Cache of unboxings and undiamondings:
+extern std::vector<bdd> unboxings;
+extern std::vector<bool> unboxed;
+extern std::vector<bdd> undiamondings;
+extern std::vector<bool> undiamonded;
+// Note: as bdd variables are integers in a fixed range, vectors are the most
+// efficient standard containers for mapping from variables to other things.
+// (In terms of time, that is)
+
+// BDD Variable to indicate whether any <>'s are present.
+// Necessary for some optimisations for K, not used for S4.
+extern const int existsDia0;
+
+// Number of BDD variables.
+extern int numVars;
+
+// Number of different roles present in the input formulae.
+extern int numRoles;
+extern bool inverseRoles;
+
+// Repeated node checking. Results caching:
+extern std::unordered_set<bdd, BddHasher> satCache;
+extern std::deque<bdd> satCacheDeque;
+extern std::map<std::vector<int>, bdd> unsatCache;
+extern std::deque<std::vector<int>> unsatCacheDeque;
+extern size_t maxCacheSize;
+
+// Loop checking / cyclic dependencies:
+// All previous worlds on the current branch of the tableau.
+extern std::unordered_set<bdd, BddHasher> dependentBDDs;
+// All worlds that are currently undecided, but have been assumed true at some point.
+extern std::unordered_set<bdd, BddHasher> everAssumedSatBDDs;
+// Temporary cache of sat results made while under certain assumptions.
+extern std::list<std::pair<std::unordered_set<bdd, BddHasher>, bdd>> tempSatCaches;
+
+
+// Global assumptions:
+extern bool globalAssumptions;
+extern bdd gammaBDD;
+extern std::unordered_set<int> gammaChildren;
+
+// S4 flag
+extern bool S4;
+
+// BDD style unsat cache
+extern bool bddUnsatCache;
+extern bdd unsatCacheBDD;
+
+// Whether to use an unsat cache at all.
+extern bool useUnsatCache;
+
+// Expore satisfying valuations from right-to-left.
+// (Default is left-to-right)
+extern bool rightToLeft;
+
+// Enable dynamic BDD variable reordering
+extern bool reorder;
+
+// Use BDDs to completely normalise all formulae as a preprocessing step.
+extern bool bddNormalise;
+
+
+// Algorithm statistics:
+extern bool verbose;
+extern bool periodicSummary;// Output summaries periodically during execution.
+extern int period;// Number of modal jumps between periodic summaries.
+extern size_t depth;	// Modal depth of the explored tableau.
+extern size_t maxDepth;
+extern int totalModalJumpsExplored;
+extern int totalBDDRefinements;
+extern int totalSatisfiableModalJumps;
+
+extern int cachedUnboxings;
+extern int unboxCacheHits;
+extern int cachedUndiamondings;
+extern int undiamondCacheHits;
+
+extern int satCacheAdds;//   Number of sat results that were cached.
+extern int unsatCacheAdds;// Number of unsat results that were cached.
+extern int satCacheHits;
+extern int unsatCacheHits;
+
+extern int numFalseFromBox;// Number of unboxings that were immediately unsatisfiable.
+extern int numFalseFromDia;// Number of modal jumps that were immediately unsatisfiable.
+extern int numFalseFromRef;// Number of refinements that were immediately unsatisfiable.
+
+extern int numResVarsIgnoredFromBox;// Modal variables ignored in unboxing base case.
+extern int numResVarsIgnoredFromDia;// Modal variables ignored in modal jump base case.
+extern int numResVarsIgnoredFromGeneral;// Modal variables ignored in general case.
+
+extern int loopsDetected;
+extern int numTempSatCaches;// Number of results cached while under assumptions
+extern int tempSatCachesConfirmed;// Results whose assumptions were confirmed.
+extern int tempSatCachesRejected;// Results whose assumptions were rejected.
+
+extern int numVarsReduced;// BoxVars determined semantically equivalent through bdd normalisation.
+
+
+
+#endif

@@ -1,0 +1,74 @@
+struct World {
+	Edge parentEdge;// The world that had the diamond that created this world.
+	std::vector<Edge> edges;
+	// Box vars in the curChoice
+	std::stack<vector<int>> curBoxVars;
+	// Box variables that have been reserved for processing.
+	std::unordered_set<int> reservedBoxVars;
+	// Dia variables that have been processed.
+	std::unordered_set<int> appliedDiaVars;
+	std::stack<bdd> curChoices;// Currently made choice
+	std::stack<bdd> choiceSets;// Possible choices
+	std::vector<SearchNode*> searchNodes;// Push and pop back
+}
+
+struct Edge {
+	int role;
+	World* otherWorld;
+	Edge(int r, World* ow): role(r), otherWorld(w) {}
+}
+
+struct SearchNode {
+	
+	virtual bool apply() = 0;
+	
+	virtual bool makeNewChoice();
+	
+	virtual void refine(std::unordered_set<int> resVars);
+	
+	virtual void revert() = 0;
+	
+	virtual void retryDiamonds();
+	
+	// negative int implies the 'not' of the positive var.
+	virtual std::unordered_set<int> getAppFalseResVars() = 0;
+	virtual std::unordered_set<int> getRefFalseResVars() = 0;
+	
+	virtual ~SearchNode();
+	
+	bool unapplied;
+	World* world;
+	int maxDepth;// Depth of the longest path from the root choice to this choice.
+	SearchNode* parent;
+	std::vector<BoxNode*> boxChildren;
+	std::vector<DiaNode*> diaChildren;
+	// Map restricting nodes to their responsible variables.
+	std::unordered_map<SearchNode*, std::unordered_set<int>> restrictedBy;
+	std::unordered_set<SearchNode*> restricts;
+	
+	SearchNode* imitating;
+	std::unordered_set<SearchNode*> imitators;
+	
+	std::unordered_set<int> refinedVars;
+}
+
+struct DiaNode {
+	
+	// Constructor for origin node for starting the procedure.
+	DiaNode (World* o) : unapplied(false), world(o), maxDepth(0) {}
+	
+	DiaNode (SearchNode* p, int md, int dv) :
+			parent(p), maxDepth(md), diaVar(dv) {}
+			
+	int diaVar;
+	std::vector<int> boxVars;
+	
+	bool stolen;
+}
+
+struct BoxNode {
+	BoxNode (SearchNode* p, int md, World* w, std::vector<int> bv) :
+			unapplied(true), parent(p), maxDepth(md), world(w), boxVars(bv) {}
+			
+	std::vector<int> boxVars;
+}

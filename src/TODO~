@@ -1,0 +1,74 @@
+Get rid of KFormula Compare entirely.
+
+DONE: 
+	NOTE: Added getRoot to bdd.h.
+	
+	Fix error. ResVars.
+	
+	More versatile cache.
+	
+	Minimal unsat subsets on InstaFalse.
+	
+	DiaNNF instead. Satone will (greedily) avoid <>s now. Always takes low path when it can.
+		Technically was wrong, but indicated that it only made things worse.
+		Second time indicates class-based differences, but nothing major anywhere. Importantly, no consistent change.
+	
+	profiling
+	
+	investigate compilation of BuDDy.
+		Must have miscompiled earlier, -p -g does indeed make it slower.
+		I don't really understand linking, but -L/usr/local/lib -lbdd is slower than -L. -lbdd
+	
+	
+	
+	
+	Fix []InstaFalse: Exists<> variable.
+		Tested as first var and as last var:
+			First var is way better. Only affects a couple of places, but first better in all.
+	
+	Complete cycle handling with sat cache.
+	
+	Test other unsatCache idea.
+	
+	Random formulae.
+		Anything unsat is incredibly rare. Only building formulae and jumping until Sat.
+			This seems to be not what bdds are good at, intuitively, as we never refine.
+			(In the current generation of stuff.)
+			
+		Time spent in IO.
+		
+	Remove atomsToVars completely. Well, as completely as possible.
+	
+	Messed around with cache size
+	
+	
+	
+	Randomised order is terrabad on S4. Non-randomised is uniformly better,
+	    often by a lot.
+	Randomised order is marginally different to unrandomised on K.
+	    Branch_p gets worse without randomisation, but still 21. 
+	
+	Custom sat Val: Avoid dia instead of avoid box:
+	    
+	
+	
+	
+Things to talk about:
+	Initial orderings are class-dependent. THey also balance two concepts: concise BDD representation, and exploring the 'best' satVals first.
+	Reordering won't necessaariy help, as it only addresses the first concern, not the second.
+		It may make the building of trees and such efficient, but it may not be a good heuristic for which branch to explore first.
+	Orderings are also related to modal jump order, if order not modified.
+		Claim that good heuristics for the order don't exist (in general).
+		Would have to balance how quickly the jump returns, with how that jump affects the rest of the process.
+	Tested some naive orderings on different components: bddvars, dia's and boxes.
+	Limiting the cache size. Worth it? Can test this later easily.
+	Randomisation: turn it off/on, look at the difference.
+	
+	
+Ask:
+	Include parseK time? parseing string into out.tbox. outputs all vars as well as reformatted formula.
+	
+	
+	
+	
+	
